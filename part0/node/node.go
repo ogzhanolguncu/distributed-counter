@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,9 +32,12 @@ type MessageInfo struct {
 }
 
 type Node struct {
-	config    Config
-	state     *State
-	peers     []string
+	config Config
+	state  *State
+
+	peers   []string
+	peersMu sync.RWMutex
+
 	transport protocol.Transport
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -41,6 +45,21 @@ type Node struct {
 	incomingMsg chan MessageInfo
 	outgoingMsg chan MessageInfo
 	syncTick    <-chan time.Time
+}
+
+func (n *Node) SetPeers(peers []string) {
+	n.peersMu.Lock()
+	defer n.peersMu.Unlock()
+	n.peers = make([]string, len(peers))
+	copy(n.peers, peers)
+}
+
+func (n *Node) GetPeers() []string {
+	n.peersMu.RLock()
+	defer n.peersMu.RUnlock()
+	peers := make([]string, len(n.peers))
+	copy(peers, n.peers)
+	return peers
 }
 
 func NewNode(config Config, transport protocol.Transport) (*Node, error) {
@@ -111,13 +130,48 @@ func (n *Node) eventLoop() {
 	}
 }
 
-// To make the convergence faster, we broadcast latest update to every other node in the cluster except this current node
-// func (n *Node) broadcastUpdate() {}
+func (n *Node) broadcastUpdate() {
+	ctx, cancel := context.WithTimeout(n.ctx, n.config.SyncInterval/2)
+	defer cancel()
+
+	g, ctx := errgroup.WithContext(ctx)
+	n.peersMu.RLock()
+	peers := n.peers
+	n.peersMu.RUnlock()
+
+	for _, peerAddr := range peers {
+		peerAddr := peerAddr // Shadow the variable for goroutine
+		g.Go(func() error {
+			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
+				n.config.Addr, peerAddr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
+
+			select {
+			case n.outgoingMsg <- MessageInfo{
+				message: protocol.Message{
+					Type:    protocol.MessageTypePush,
+					Version: n.state.version.Load(),
+					Counter: n.state.counter.Load(),
+				},
+				addr: peerAddr,
+			}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+	}
+}
 
 // We periodically pull other node's states. This is also called "Anti-entropy".
 // This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
+	n.peersMu.RLock()
 	peers := n.peers
+	n.peersMu.RUnlock()
 
 	if len(peers) == 0 {
 		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
@@ -136,7 +190,8 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	for _, peerAddr := range selectedPeers[:numPeers] {
+	for _, peer := range selectedPeers[:numPeers] {
+		peerAddr := peer // Shadow the variable for goroutine
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
 				n.config.Addr, peerAddr, protocol.MessageTypePull, n.state.version.Load(), n.state.counter.Load())
@@ -169,10 +224,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	switch inc.message.Type {
 	case protocol.MessageTypePull:
 
-		// TODO: Later we'll propagate that change to others to converge faster
 		if inc.message.Version > n.state.version.Load() {
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			n.broadcastUpdate()
 		}
 
 		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
@@ -186,10 +241,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			addr: inc.addr,
 		}
 	case protocol.MessageTypePush:
-		// TODO: Later we'll propagate that change to others to converge faster
 		if inc.message.Version > n.state.version.Load() {
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			n.broadcastUpdate()
 		}
 	}
 }
