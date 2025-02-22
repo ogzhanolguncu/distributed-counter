@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
@@ -21,9 +21,8 @@ type Config struct {
 }
 
 type State struct {
-	counter uint64
-	version uint32
-	mu      sync.RWMutex
+	counter atomic.Uint64
+	version atomic.Uint32
 }
 
 type MessageInfo struct {
@@ -94,7 +93,7 @@ func (n *Node) eventLoop() {
 		select {
 		case <-n.ctx.Done():
 			log.Printf("[Node %s] Shutting down with version=%d and counter=%d",
-				n.config.Addr, n.state.version, n.state.counter)
+				n.config.Addr, n.state.version.Load(), n.state.counter.Load())
 			return
 
 		case msg := <-n.incomingMsg:
@@ -105,22 +104,20 @@ func (n *Node) eventLoop() {
 				log.Printf("[Node %s] Failed to send message to %s: %v",
 					n.config.Addr, msg.addr, err)
 			}
+
 		case <-n.syncTick:
 			n.pullState()
 		}
 	}
 }
 
-// To make the convergence faster, we broadcast latest update to every other node in the cluster
+// To make the convergence faster, we broadcast latest update to every other node in the cluster except this current node
 // func (n *Node) broadcastUpdate() {}
 
 // We periodically pull other node's states. This is also called "Anti-entropy".
 // This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
-	n.state.mu.RLock()
 	peers := n.peers
-	currentVersion := n.state.version
-	n.state.mu.RUnlock()
 
 	if len(peers) == 0 {
 		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
@@ -139,18 +136,17 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	for _, peer := range selectedPeers[:numPeers] {
-		peerAddr := peer // Create new variable for goroutine
+	for _, peerAddr := range selectedPeers[:numPeers] {
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePull, n.state.version, n.state.counter)
+				n.config.Addr, peerAddr, protocol.MessageTypePull, n.state.version.Load(), n.state.counter.Load())
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
 				message: protocol.Message{
 					Type:    protocol.MessageTypePull,
-					Version: currentVersion,
-					Counter: n.state.counter,
+					Version: n.state.version.Load(),
+					Counter: n.state.counter.Load(),
 				},
 				addr: peerAddr,
 			}:
@@ -166,11 +162,7 @@ func (n *Node) pullState() {
 	}
 }
 
-// Handle all incoming traffic then decide if it's pull or push then act
 func (n *Node) handleIncMsg(inc MessageInfo) {
-	n.state.mu.Lock()
-	defer n.state.mu.Unlock()
-
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
@@ -178,27 +170,26 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	case protocol.MessageTypePull:
 
 		// TODO: Later we'll propagate that change to others to converge faster
-		if inc.message.Version > n.state.version {
-			n.state.version = inc.message.Version
-			n.state.counter = inc.message.Counter
+		if inc.message.Version > n.state.version.Load() {
+			n.state.version.Store(inc.message.Version)
+			n.state.counter.Store(inc.message.Counter)
 		}
 
 		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-			n.config.Addr, inc.addr, protocol.MessageTypePush, n.state.version, n.state.counter)
+			n.config.Addr, inc.addr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
 		n.outgoingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
-				Version: n.state.version,
-				Counter: n.state.counter,
+				Version: n.state.version.Load(),
+				Counter: n.state.counter.Load(),
 			},
 			addr: inc.addr,
 		}
-
 	case protocol.MessageTypePush:
 		// TODO: Later we'll propagate that change to others to converge faster
-		if inc.message.Version > n.state.version {
-			n.state.version = inc.message.Version
-			n.state.counter = inc.message.Counter
+		if inc.message.Version > n.state.version.Load() {
+			n.state.version.Store(inc.message.Version)
+			n.state.counter.Store(inc.message.Counter)
 		}
 	}
 }

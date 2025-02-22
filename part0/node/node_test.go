@@ -71,18 +71,14 @@ func TestNodeBasicOperation(t *testing.T) {
 	node2.peers = []string{"node1", "node3"}
 	node3.peers = []string{"node1", "node2"}
 
-	node1.state.mu.Lock()
-	node1.state.counter = 42
-	node1.state.version = 1
-	node1.state.mu.Unlock()
+	node1.state.counter.Store(42)
+	node1.state.version.Store(1)
 
 	time.Sleep(500 * time.Millisecond)
 
 	assertNodeState := func(n *Node, expectedCounter uint64, expectedVersion uint32) {
-		n.state.mu.RLock()
-		defer n.state.mu.RUnlock()
-		require.Equal(t, expectedCounter, n.state.counter)
-		require.Equal(t, expectedVersion, n.state.version)
+		require.Equal(t, expectedCounter, n.state.counter.Load())
+		require.Equal(t, expectedVersion, n.state.version.Load())
 	}
 
 	assertNodeState(node2, 42, 1)
@@ -98,25 +94,17 @@ func TestNodeStateConvergence(t *testing.T) {
 	node1.peers = []string{"node2"}
 	node2.peers = []string{"node1"}
 
-	node1.state.mu.Lock()
-	node1.state.counter = 100
-	node1.state.version = 1
-	node1.state.mu.Unlock()
+	node1.state.counter.Store(100)
+	node1.state.version.Store(1)
 
-	node2.state.mu.Lock()
-	node2.state.counter = 50
-	node2.state.version = 2
-	node2.state.mu.Unlock()
+	node2.state.counter.Store(50)
+	node2.state.version.Store(2)
 
 	time.Sleep(500 * time.Millisecond)
 
-	node1.state.mu.RLock()
-	require.Equal(t, uint64(50), node1.state.counter)
-	require.Equal(t, uint32(2), node1.state.version)
-	node1.state.mu.RUnlock()
+	require.Equal(t, uint64(50), node1.state.counter.Load())
+	require.Equal(t, uint32(2), node1.state.version.Load())
 
-	node2.state.mu.RLock()
-	require.Equal(t, uint64(50), node2.state.counter)
-	require.Equal(t, uint32(2), node2.state.version)
-	node2.state.mu.RUnlock()
+	require.Equal(t, uint64(50), node2.state.counter.Load())
+	require.Equal(t, uint32(2), node2.state.version.Load())
 }
