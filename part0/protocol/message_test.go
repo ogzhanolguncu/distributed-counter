@@ -11,8 +11,6 @@ func TestMessages(t *testing.T) {
 	messages := []Message{
 		{Type: MessageTypePush, Version: 1, Counter: 12},
 		{Type: MessageTypePull, Version: 2, Counter: 0},
-		{Type: MessageTypePullAck, Version: 1, Counter: 65535},
-		{Type: MessageTypePushAck, Version: 0, Counter: 1},
 		{Type: MessageTypePush, Version: ^uint32(0), Counter: ^uint64(0)}, // Max values
 	}
 

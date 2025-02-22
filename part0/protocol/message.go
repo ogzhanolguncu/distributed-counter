@@ -8,10 +8,13 @@ import (
 const (
 	MessageTypePull = 0x01
 	MessageTypePush = 0x02
+)
 
-	// Will later used to ack message for retries
-	MessageTypePullAck = 0x03
-	MessageTypePushAck = 0x04
+const (
+	TypeSize    = 1
+	VersionSize = 4
+	CounterSize = 8
+	MessageSize = TypeSize + VersionSize + CounterSize
 )
 
 type Message struct {
@@ -21,7 +24,7 @@ type Message struct {
 }
 
 func (m *Message) Encode() []byte {
-	buf := make([]byte, 13) // 1 byte type + 4 byte version + 8 byte counter
+	buf := make([]byte, MessageSize) // 1 byte type + 4 byte version + 8 byte counter
 	buf[0] = m.Type
 	binary.BigEndian.PutUint32(buf[1:5], m.Version)
 	binary.BigEndian.PutUint64(buf[5:], m.Counter)
@@ -29,7 +32,7 @@ func (m *Message) Encode() []byte {
 }
 
 func DecodeMessage(data []byte) (*Message, error) {
-	if len(data) < 13 {
+	if len(data) < MessageSize {
 		return nil, fmt.Errorf("message too short: %d bytes", len(data))
 	}
 

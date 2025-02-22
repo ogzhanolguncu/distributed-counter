@@ -249,14 +249,23 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	}
 }
 
+func (n *Node) Increment() {
+	n.state.counter.Add(1)
+	n.state.version.Add(1)
+	n.broadcastUpdate()
+}
+
+func (n *Node) Decrement() {
+	n.state.counter.Add(^uint64(0))
+	n.state.version.Add(1)
+	n.broadcastUpdate()
+}
+
+func (n *Node) GetCount() uint64 {
+	return n.state.counter.Load()
+}
+
 func (n *Node) Close() error {
 	n.cancel()
 	return n.transport.Close()
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
