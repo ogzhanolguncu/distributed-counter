@@ -225,14 +225,12 @@ func TestRingTopology(t *testing.T) {
 	numNodes := 10
 	nodes := make([]*Node, numNodes)
 
-	// Create nodes
 	for i := 0; i < numNodes; i++ {
 		addr := fmt.Sprintf("node%d", i)
 		nodes[i] = createTestNode(t, addr, 100*time.Millisecond)
 		defer nodes[i].Close()
 	}
 
-	// Set up ring topology - each node connects to its neighbors
 	for i := 0; i < numNodes; i++ {
 		prev := (i - 1 + numNodes) % numNodes
 		next := (i + 1) % numNodes
@@ -242,10 +240,8 @@ func TestRingTopology(t *testing.T) {
 		})
 	}
 
-	// Update one node and verify propagation
 	nodes[0].state.counter.Store(42)
 	nodes[0].state.version.Store(1)
 
-	// Should propagate through the ring
 	waitForConvergence(t, nodes, 42, 1, 3*time.Second)
 }
