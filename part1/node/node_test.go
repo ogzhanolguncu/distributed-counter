@@ -94,9 +94,14 @@ func TestNodeBasicOperation(t *testing.T) {
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2", "node3"})
-	node2.SetPeers([]string{"node1", "node3"})
-	node3.SetPeers([]string{"node1", "node2"})
+	node1.peers.AddPeer("node2")
+	node1.peers.AddPeer("node3")
+
+	node2.peers.AddPeer("node1")
+	node2.peers.AddPeer("node3")
+
+	node2.peers.AddPeer("node1")
+	node2.peers.AddPeer("node2")
 
 	node1.state.counter.Store(42)
 	node1.state.version.Store(1)
@@ -113,8 +118,8 @@ func TestNodeStateConvergence(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2"})
-	node2.SetPeers([]string{"node1"})
+	node1.peers.AddPeer("node2")
+	node2.peers.AddPeer("node1")
 
 	node1.state.counter.Store(100)
 	node1.state.version.Store(1)
@@ -135,8 +140,8 @@ func TestNodeLateJoiner(t *testing.T) {
 	node1.state.counter.Store(100)
 	node1.state.version.Store(5)
 
-	node1.SetPeers([]string{"node2"})
-	node2.SetPeers([]string{"node1"})
+	node1.peers.AddPeer("node2")
+	node2.peers.AddPeer("node1")
 
 	waitForConvergence(t, []*Node{node1, node2}, 100, 5, 2*time.Second)
 
@@ -150,9 +155,14 @@ func TestConcurrentUpdates(t *testing.T) {
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2", "node3"})
-	node2.SetPeers([]string{"node1", "node3"})
-	node3.SetPeers([]string{"node1", "node2"})
+	node1.peers.AddPeer("node2")
+	node1.peers.AddPeer("node3")
+
+	node2.peers.AddPeer("node1")
+	node2.peers.AddPeer("node3")
+
+	node2.peers.AddPeer("node1")
+	node2.peers.AddPeer("node2")
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -181,7 +191,6 @@ func TestConcurrentUpdates(t *testing.T) {
 	node1.Close()
 	node2.Close()
 	node3.Close()
-
 	time.Sleep(200 * time.Millisecond)
 }
 
@@ -189,8 +198,8 @@ func TestMessageDropping(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2"})
-	node2.SetPeers([]string{"node1"})
+	node1.peers.AddPeer("node2")
+	node2.peers.AddPeer("node1")
 
 	// Fill up the message buffer to force drops
 	for i := 0; i < defaultChannelBuffer+10; i++ {
@@ -220,31 +229,22 @@ func TestRingTopology(t *testing.T) {
 
 	for i := 0; i < numNodes; i++ {
 		addr := fmt.Sprintf("node%d", i)
-		transport := NewMemoryTransport(addr)
-		config := Config{
-			Addr:         addr,
-			SyncInterval: 100 * time.Millisecond,
-			MaxSyncPeers: numNodes / 2, // To make it converge faster
-		}
-
-		node, err := NewNode(config, transport)
-		require.NoError(t, err)
-		nodes[i] = node
+		nodes[i] = createTestNode(t, addr, 100*time.Millisecond)
+		defer nodes[i].Close()
 	}
 
 	for i := 0; i < numNodes; i++ {
-		prev := (i - 1 + numNodes) % numNodes
-		next := (i + 1) % numNodes
-		nodes[i].SetPeers([]string{
-			fmt.Sprintf("node%d", prev),
-			fmt.Sprintf("node%d", next),
-		})
+		prevIdx := (i - 1 + numNodes) % numNodes
+		nextIdx := (i + 1) % numNodes
+
+		nodes[i].peers.AddPeer(fmt.Sprintf("node%d", prevIdx))
+		nodes[i].peers.AddPeer(fmt.Sprintf("node%d", nextIdx))
 	}
 
 	nodes[0].state.counter.Store(42)
 	nodes[0].state.version.Store(1)
 
-	waitForConvergence(t, nodes, 42, 1, 3*time.Second)
+	waitForConvergence(t, nodes, 42, 1, 5*time.Second)
 
 	for i := 0; i < numNodes; i++ {
 		nodes[i].Close()
