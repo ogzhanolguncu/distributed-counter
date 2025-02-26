@@ -2,28 +2,36 @@ package protocol
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
 type TCPTransport struct {
-	addr     string
+	addr     string // This node's listening address
 	listener net.Listener
 	handler  func(string, []byte) error
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+
+	// Map to keep track of actual peer addresses
+	peerAddrs sync.Map // Maps IP -> full listening address
 }
 
-func NewTCPTransport() *TCPTransport {
+func NewTCPTransport(addr string) (*TCPTransport, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TCPTransport{
-		ctx:    ctx,
-		cancel: cancel,
-	}
+		addr:     addr,
+		listener: listener,
+		ctx:      ctx,
+		cancel:   cancel,
+	}, nil
 }
 
 func (t *TCPTransport) Send(addr string, data []byte) error {
@@ -33,23 +41,23 @@ func (t *TCPTransport) Send(addr string, data []byte) error {
 	}
 	defer conn.Close()
 
-	return retry(t.ctx, 5, 500*time.Millisecond, func() error {
-		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			return err
-		}
-		_, err = conn.Write(data)
-		return err
-	})
-}
+	// Send our address as a prefix (format: "ADDR:127.0.0.1:9000|")
+	prefix := "ADDR:" + t.addr + "|"
+	prefixBytes := []byte(prefix)
 
-func (t *TCPTransport) Listen(handler func(string, []byte) error) error {
-	listener, err := net.Listen("tcp", t.addr)
+	// First send the prefix
+	_, err = conn.Write(prefixBytes)
 	if err != nil {
 		return err
 	}
-	t.listener = listener
-	t.handler = handler
 
+	// Then send the actual data
+	_, err = conn.Write(data)
+	return err
+}
+
+func (t *TCPTransport) Listen(handler func(string, []byte) error) error {
+	t.handler = handler
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
@@ -82,8 +90,38 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		return
 	}
 
+	// Extract sender address from message prefix
+	data := buf[:n]
+	message := string(data)
+
+	// Look for sender address prefix
+	var senderAddr string
+	remoteIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+
+	if strings.HasPrefix(message, "ADDR:") {
+		// Find the end of the address
+		endIndex := strings.Index(message, "|")
+		if endIndex > 5 { // "ADDR:" is 5 chars
+			senderAddr = message[5:endIndex]
+			// Store the mapping from IP to listening address
+			t.peerAddrs.Store(remoteIP, senderAddr)
+			// Remove the prefix from the data
+			data = data[endIndex+1:]
+		}
+	}
+
+	// If we couldn't extract address, try to look it up
+	if senderAddr == "" {
+		if addr, ok := t.peerAddrs.Load(remoteIP); ok {
+			senderAddr = addr.(string)
+		} else {
+			// Fall back to connection address if we have nothing better
+			senderAddr = conn.RemoteAddr().String()
+		}
+	}
+
 	if t.handler != nil {
-		t.handler(conn.RemoteAddr().String(), buf[:n])
+		t.handler(senderAddr, data)
 	}
 }
 
@@ -94,23 +132,4 @@ func (t *TCPTransport) Close() error {
 	}
 	t.wg.Wait()
 	return nil
-}
-
-func retry(ctx context.Context, attempts int, sleep time.Duration, f func() error) (err error) {
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			log.Println("retrying after error:", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(sleep):
-				sleep *= 2
-			}
-		}
-		err = f()
-		if err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("after %d attempts, last error: %s", attempts, err)
 }

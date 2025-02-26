@@ -1,46 +1,41 @@
 package peer
 
-import "time"
+import "sync"
 
-type PeerState struct {
-	Addr     string
-	Version  uint32
-	LastSeen time.Time
-	isActive bool
+type Peer struct {
+	Addr string
 }
 
-type Peer interface {
-	GetAddr() string
-	GetVersion() uint32
-	IsActive() bool
-	UpdateVersion(version uint32)
-	UpdateLastSeen()
+type PeerManager struct {
+	peers map[string]*Peer
+	mu    sync.RWMutex
 }
 
-func NewPeer(addr string) *PeerState {
-	return &PeerState{
-		isActive: true,
-		LastSeen: time.Now(),
-		Addr:     addr,
+func NewPeerManager() *PeerManager {
+	return &PeerManager{
+		peers: make(map[string]*Peer),
 	}
 }
 
-func (p *PeerState) GetAddr() string {
-	return p.Addr
+func (pm *PeerManager) AddPeer(addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.peers[addr] = &Peer{Addr: addr}
 }
 
-func (p *PeerState) GetVersion() uint32 {
-	return p.Version
+func (pm *PeerManager) RemovePeer(addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.peers, addr)
 }
 
-func (p *PeerState) IsActive() bool {
-	return p.isActive && time.Since(p.LastSeen) < time.Minute
-}
+func (pm *PeerManager) GetPeers() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 
-func (p *PeerState) UpdateVersion(version uint32) {
-	p.Version = version
-}
-
-func (p *PeerState) UpdateLastSeen() {
-	p.LastSeen = time.Now()
+	peers := make([]string, 0, len(pm.peers))
+	for addr := range pm.peers {
+		peers = append(peers, addr)
+	}
+	return peers
 }

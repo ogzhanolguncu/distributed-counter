@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,7 +85,8 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node
 		MaxSyncPeers: 2,
 	}
 
-	node, err := NewNode(config, transport)
+	peerManager := peer.NewPeerManager()
+	node, err := NewNode(config, transport, peerManager)
 	require.NoError(t, err)
 	return node
 }

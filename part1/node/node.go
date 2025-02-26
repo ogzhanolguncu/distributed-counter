@@ -35,7 +35,7 @@ type Node struct {
 	config Config
 	state  *State
 
-	peers peer.PeerManager
+	peers *peer.PeerManager
 
 	transport protocol.Transport
 	ctx       context.Context
@@ -46,13 +46,13 @@ type Node struct {
 	syncTick    <-chan time.Time
 }
 
-func NewNode(config Config, transport protocol.Transport) (*Node, error) {
+func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	node := &Node{
 		config:    config,
 		state:     &State{},
-		peers:     peer.NewPeerManager(),
+		peers:     peerManager,
 		ctx:       ctx,
 		cancel:    cancel,
 		transport: transport,
@@ -120,8 +120,8 @@ func (n *Node) broadcastUpdate() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	for _, peerAddr := range n.peers.GetAllActivePeers() {
-		peerAddr := peerAddr.GetAddr() // Shadow the variable for goroutine
+	for _, peerAddr := range n.peers.GetPeers() {
+		peerAddr := peerAddr // Shadow the variable for goroutine
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
 				n.config.Addr, peerAddr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
@@ -150,7 +150,7 @@ func (n *Node) broadcastUpdate() {
 // We periodically pull other node's states. This is also called "Anti-entropy".
 // This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
-	peers := n.peers.GetAllActivePeers()
+	peers := n.peers.GetPeers()
 
 	if len(peers) == 0 {
 		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
@@ -158,9 +158,9 @@ func (n *Node) pullState() {
 	}
 
 	numPeers := min(n.config.MaxSyncPeers, len(peers))
-	selectedPeers := make([]string, len(peers))
+	selectedPeers := make([]string, 0, len(peers))
 	for _, peer := range peers {
-		selectedPeers = append(selectedPeers, peer.GetAddr())
+		selectedPeers = append(selectedPeers, peer)
 	}
 	rand.Shuffle(len(selectedPeers), func(i, j int) {
 		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
@@ -228,6 +228,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			n.broadcastUpdate()
 		}
 	}
+}
+
+func (n *Node) GetPeerManager() *peer.PeerManager {
+	return n.peers
 }
 
 func (n *Node) Increment() {
