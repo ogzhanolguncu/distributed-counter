@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
 	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
 	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
 	"golang.org/x/sync/errgroup"
@@ -49,6 +50,12 @@ type Node struct {
 func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
+	assertions.Assert(config.MaxSyncPeers > 0, "max sync peers must be positive")
+	assertions.Assert(config.Addr != "", "node address cannot be empty")
+	assertions.AssertNotNil(transport, "transport cannot be nil")
+	assertions.AssertNotNil(peerManager, "peer manager cannot be nil")
+
 	node := &Node{
 		config:    config,
 		state:     &State{},
@@ -62,6 +69,10 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 		syncTick:    time.NewTicker(config.SyncInterval).C,
 	}
 
+	assertions.AssertNotNil(node.state, "node state must be initialized")
+	assertions.AssertNotNil(node.ctx, "node context must be initialized")
+	assertions.AssertNotNil(node.cancel, "node cancel function must be initialized")
+
 	if err := node.startTransport(); err != nil {
 		cancel() // Clean up if we fail to start
 		return nil, err
@@ -73,10 +84,18 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 
 func (n *Node) startTransport() error {
 	err := n.transport.Listen(func(addr string, data []byte) error {
+		assertions.Assert(addr != "", "incoming addr cannot be empty")
+		assertions.AssertNotNil(data, "incoming data cannot be nil")
+
 		msg, err := protocol.DecodeMessage(data)
 		if err != nil {
 			return fmt.Errorf("[Node %s]: StartTransport failed to read %w", n.config.Addr, err)
 		}
+
+		assertions.AssertNotNil(msg, "decoded message cannot be nil")
+		assertions.Assert(msg.Type == protocol.MessageTypePull || msg.Type == protocol.MessageTypePush,
+			"invalid message type")
+
 		select {
 		case n.incomingMsg <- MessageInfo{message: *msg, addr: addr}:
 		default:
@@ -100,10 +119,19 @@ func (n *Node) eventLoop() {
 			return
 
 		case msg := <-n.incomingMsg:
+			assertions.Assert(msg.addr != "", "incoming message addr cannot be empty")
 			n.handleIncMsg(msg)
 
 		case msg := <-n.outgoingMsg:
-			if err := n.transport.Send(msg.addr, msg.message.Encode()); err != nil {
+			assertions.Assert(msg.addr != "", "outgoing addr cannot be empty")
+			assertions.Assert(msg.message.Type == protocol.MessageTypePull ||
+				msg.message.Type == protocol.MessageTypePush, "invalid message type")
+
+			encodedMsg := msg.message.Encode()
+			assertions.AssertEqual(protocol.MessageSize, len(encodedMsg),
+				fmt.Sprintf("encoded message must be exactly %d bytes", protocol.MessageSize))
+
+			if err := n.transport.Send(msg.addr, encodedMsg); err != nil {
 				log.Printf("[Node %s] Failed to send message to %s: %v",
 					n.config.Addr, msg.addr, err)
 			}
@@ -115,12 +143,18 @@ func (n *Node) eventLoop() {
 }
 
 func (n *Node) broadcastUpdate() {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
+
 	ctx, cancel := context.WithTimeout(n.ctx, n.config.SyncInterval/2)
 	defer cancel()
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	for _, peerAddr := range n.peers.GetPeers() {
+	peers := n.peers.GetPeers()
+	for _, peerAddr := range peers {
+		assertions.Assert(peerAddr != "", "peer address cannot be empty")
+
 		peerAddr := peerAddr // Shadow the variable for goroutine
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
@@ -150,6 +184,8 @@ func (n *Node) broadcastUpdate() {
 // We periodically pull other node's states. This is also called "Anti-entropy".
 // This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
+	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
+
 	peers := n.peers.GetPeers()
 
 	if len(peers) == 0 {
@@ -158,8 +194,15 @@ func (n *Node) pullState() {
 	}
 
 	numPeers := min(n.config.MaxSyncPeers, len(peers))
+	assertions.Assert(numPeers > 0, "number of peers to sync with must be positive")
+
 	selectedPeers := make([]string, 0, len(peers))
-	selectedPeers = append(selectedPeers, peers...)
+	for _, peer := range peers {
+		assertions.Assert(peer != "", "peer address cannot be empty")
+		selectedPeers = append(selectedPeers, peer)
+	}
+
+	assertions.AssertEqual(len(selectedPeers), len(peers), "all peers must be selected initially")
 
 	rand.Shuffle(len(selectedPeers), func(i, j int) {
 		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
@@ -198,15 +241,20 @@ func (n *Node) pullState() {
 }
 
 func (n *Node) handleIncMsg(inc MessageInfo) {
+	assertions.Assert(inc.addr != "", "incoming message address cannot be empty")
+	assertions.Assert(inc.message.Type == protocol.MessageTypePull ||
+		inc.message.Type == protocol.MessageTypePush, "invalid message type")
+
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
 	switch inc.message.Type {
 	case protocol.MessageTypePull:
-
 		if inc.message.Version > n.state.version.Load() {
+			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
 			n.broadcastUpdate()
 		}
 
@@ -222,42 +270,67 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		}
 	case protocol.MessageTypePush:
 		if inc.message.Version > n.state.version.Load() {
+			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
 			n.broadcastUpdate()
 		}
 	}
 }
 
 func (n *Node) GetPeerManager() *peer.PeerManager {
+	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
 	return n.peers
 }
 
 func (n *Node) Increment() {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	oldCounter := n.state.counter.Load()
+	oldVersion := n.state.version.Load()
+
 	n.state.counter.Add(1)
 	n.state.version.Add(1)
+
+	assertions.Assert(n.state.counter.Load() > oldCounter, "counter must increase after Increment")
+	assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after Increment")
+
 	n.broadcastUpdate()
 }
 
 func (n *Node) Decrement() {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	oldCounter := n.state.counter.Load()
+	oldVersion := n.state.version.Load()
+
 	n.state.counter.Add(^uint64(0))
 	n.state.version.Add(1)
+
+	assertions.Assert(n.state.counter.Load() < oldCounter, "counter must decrease after Decrement")
+	assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after Decrement")
+
 	n.broadcastUpdate()
 }
 
 func (n *Node) GetCounter() uint64 {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	return n.state.counter.Load()
 }
 
-func (n *Node) GetVersion() uint64 {
-	return n.state.counter.Load()
+func (n *Node) GetVersion() uint32 {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	return n.state.version.Load()
 }
 
 func (n *Node) GetAddr() string {
+	assertions.Assert(n.config.Addr != "", "node addr cannot be empty")
 	return n.config.Addr
 }
 
 func (n *Node) Close() error {
+	assertions.AssertNotNil(n.cancel, "cancel function cannot be nil")
+	assertions.AssertNotNil(n.transport, "transport cannot be nil")
+
 	n.cancel()
 	return n.transport.Close()
 }
