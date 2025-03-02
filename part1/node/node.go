@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
 	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part1/protocol"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -246,8 +246,16 @@ func (n *Node) Decrement() {
 	n.broadcastUpdate()
 }
 
-func (n *Node) GetCount() uint64 {
+func (n *Node) GetCounter() uint64 {
 	return n.state.counter.Load()
+}
+
+func (n *Node) GetVersion() uint64 {
+	return n.state.counter.Load()
+}
+
+func (n *Node) GetAddr() string {
+	return n.config.Addr
 }
 
 func (n *Node) Close() error {

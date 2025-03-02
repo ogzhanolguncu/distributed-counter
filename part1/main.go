@@ -64,7 +64,7 @@ func main() {
 	fmt.Println("\nIncrementing counter on node 0...")
 	for range 5 {
 		nodes[0].Increment()
-		fmt.Printf("Node 0 incremented counter to %d\n", nodes[0].GetCount())
+		fmt.Printf("Node 0 incremented counter to %d\n", nodes[0].GetCounter())
 		time.Sleep(4 * time.Second)
 	}
 
@@ -73,7 +73,7 @@ func main() {
 
 	fmt.Println("\nFinal counter values:")
 	for i, n := range nodes {
-		fmt.Printf("Node %d counter: %d\n", i, n.GetCount())
+		fmt.Printf("Node %d counter: %d\n", i, n.GetCounter())
 	}
 
 	gracefulShutdown(nodes)
