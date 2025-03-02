@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ogzhanolguncu/distributed-counter/part0/assertions"
 	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
 	"golang.org/x/sync/errgroup"
 )
@@ -48,10 +49,14 @@ type Node struct {
 }
 
 func (n *Node) SetPeers(peers []string) {
+	assertions.Assert(len(peers) > 0, "arg peers cannot be empty")
+
 	n.peersMu.Lock()
 	defer n.peersMu.Unlock()
 	n.peers = make([]string, len(peers))
 	copy(n.peers, peers)
+
+	assertions.AssertEqual(len(n.peers), len(peers), "node's peers should be equal to peers")
 }
 
 func (n *Node) GetPeers() []string {
@@ -64,6 +69,11 @@ func (n *Node) GetPeers() []string {
 
 func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
+	assertions.Assert(config.MaxSyncPeers > 0, "max sync peers must be positive")
+	assertions.Assert(config.Addr != "", "node address cannot be empty")
+	assertions.AssertNotNil(transport, "transport cannot be nil")
 
 	node := &Node{
 		config:    config,
@@ -89,6 +99,9 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 
 func (n *Node) startTransport() error {
 	err := n.transport.Listen(func(addr string, data []byte) error {
+		assertions.Assert(addr != "", "incoming addr cannot be empty")
+		assertions.AssertNotNil(data, "incoming data cannot be nil or empty")
+
 		msg, err := protocol.DecodeMessage(data)
 		if err != nil {
 			return fmt.Errorf("[Node %s]: StartTransport failed to read %w", n.config.Addr, err)
@@ -119,6 +132,9 @@ func (n *Node) eventLoop() {
 			n.handleIncMsg(msg)
 
 		case msg := <-n.outgoingMsg:
+			assertions.Assert(msg.addr != "", "outgoing addr cannot be empty")
+			assertions.AssertEqual(protocol.MessageSize, len(msg.message.Encode()), fmt.Sprintf("formatted message cannot be smaller than %d", protocol.MessageSize))
+
 			if err := n.transport.Send(msg.addr, msg.message.Encode()); err != nil {
 				log.Printf("[Node %s] Failed to send message to %s: %v",
 					n.config.Addr, msg.addr, err)
@@ -218,15 +234,20 @@ func (n *Node) pullState() {
 }
 
 func (n *Node) handleIncMsg(inc MessageInfo) {
+	assertions.Assert(inc.message.Type == protocol.MessageTypePull ||
+		inc.message.Type == protocol.MessageTypePush,
+		"invalid message type")
+
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
 	switch inc.message.Type {
 	case protocol.MessageTypePull:
-
 		if inc.message.Version > n.state.version.Load() {
+			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
 			n.broadcastUpdate()
 		}
 
@@ -242,34 +263,51 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		}
 	case protocol.MessageTypePush:
 		if inc.message.Version > n.state.version.Load() {
+			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
+			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
 			n.broadcastUpdate()
 		}
 	}
 }
 
 func (n *Node) Increment() {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	oldCounter := n.state.counter.Load()
+	oldVersion := n.state.version.Load()
+	defer assertions.Assert(oldCounter < n.state.counter.Load(), "counter must increase after Increment")
+	defer assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
+
 	n.state.counter.Add(1)
 	n.state.version.Add(1)
 	n.broadcastUpdate()
 }
 
 func (n *Node) Decrement() {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	oldCounter := n.state.counter.Load()
+	oldVersion := n.state.version.Load()
+	defer assertions.Assert(oldCounter > n.state.counter.Load(), "counter must decrease after Decrease")
+	defer assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
+
 	n.state.counter.Add(^uint64(0))
 	n.state.version.Add(1)
 	n.broadcastUpdate()
 }
 
 func (n *Node) GetCounter() uint64 {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	return n.state.counter.Load()
 }
 
-func (n *Node) GetVersion() uint64 {
-	return n.state.counter.Load()
+func (n *Node) GetVersion() uint32 {
+	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	return n.state.version.Load()
 }
 
 func (n *Node) GetAddr() string {
+	assertions.Assert(n.config.Addr != "", "node addr cannot be empty")
 	return n.config.Addr
 }
 
