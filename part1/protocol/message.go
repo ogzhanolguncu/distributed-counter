@@ -3,6 +3,8 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/ogzhanolguncu/distributed-counter/part1/assertions"
 )
 
 const (
@@ -28,6 +30,8 @@ func (m *Message) Encode() []byte {
 	buf[0] = m.Type
 	binary.BigEndian.PutUint32(buf[1:5], m.Version)
 	binary.BigEndian.PutUint64(buf[5:], m.Counter)
+
+	assertions.AssertEqual(MessageSize, len(buf), "encoded message size must match expected size")
 	return buf
 }
 

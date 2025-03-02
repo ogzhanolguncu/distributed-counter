@@ -88,6 +88,10 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 		syncTick:    time.NewTicker(config.SyncInterval).C,
 	}
 
+	assertions.AssertNotNil(node.state, "node state must be initialized")
+	assertions.AssertNotNil(node.ctx, "node context must be initialized")
+	assertions.AssertNotNil(node.cancel, "node cancel function must be initialized")
+
 	if err := node.startTransport(); err != nil {
 		cancel() // Clean up if we fail to start
 		return nil, err
@@ -195,6 +199,8 @@ func (n *Node) pullState() {
 	}
 
 	numPeers := min(n.config.MaxSyncPeers, len(peers))
+	assertions.Assert(numPeers > 0, "number of peers to sync with must be positive")
+
 	selectedPeers := make([]string, len(peers))
 	copy(selectedPeers, peers)
 	rand.Shuffle(len(selectedPeers), func(i, j int) {
@@ -276,11 +282,12 @@ func (n *Node) Increment() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	oldCounter := n.state.counter.Load()
 	oldVersion := n.state.version.Load()
-	defer assertions.Assert(oldCounter < n.state.counter.Load(), "counter must increase after Increment")
-	defer assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
 
 	n.state.counter.Add(1)
 	n.state.version.Add(1)
+
+	assertions.Assert(oldCounter < n.state.counter.Load(), "counter must increase after Increment")
+	assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
 	n.broadcastUpdate()
 }
 
@@ -288,11 +295,13 @@ func (n *Node) Decrement() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	oldCounter := n.state.counter.Load()
 	oldVersion := n.state.version.Load()
-	defer assertions.Assert(oldCounter > n.state.counter.Load(), "counter must decrease after Decrease")
-	defer assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
 
 	n.state.counter.Add(^uint64(0))
 	n.state.version.Add(1)
+
+	assertions.Assert(oldCounter > n.state.counter.Load(), "counter must decrease after Decrease")
+	assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
+
 	n.broadcastUpdate()
 }
 
@@ -312,6 +321,9 @@ func (n *Node) GetAddr() string {
 }
 
 func (n *Node) Close() error {
+	assertions.AssertNotNil(n.cancel, "cancel function cannot be nil")
+	assertions.AssertNotNil(n.transport, "transport cannot be nil")
+
 	n.cancel()
 	return n.transport.Close()
 }
