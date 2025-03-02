@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
-	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
 	"github.com/stretchr/testify/require"
 )
 

@@ -8,30 +8,47 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part1/node"
-	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part1/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part2/discovery"
+	"github.com/ogzhanolguncu/distributed-counter/part2/node"
+	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
 )
 
 const (
-	numNodes     = 3
-	syncInterval = 2 * time.Second
-	maxSyncPeers = 2
-	basePort     = 9000
+	numNodes            = 3
+	syncInterval        = 2 * time.Second
+	maxSyncPeers        = 2
+	basePort            = 9000
+	discoveryServerPort = 8000
+	discoveryInterval   = 3 * time.Second
+	heartbeatInterval   = 1 * time.Second
+	cleanupInterval     = 5 * time.Second
 )
 
 func main() {
+	discoveryServerAddr := fmt.Sprintf("127.0.0.1:%d", discoveryServerPort)
+	discoveryServer := discovery.NewDiscoveryServer(discoveryServerAddr, cleanupInterval)
+
+	fmt.Printf("Starting discovery server at %s\n", discoveryServerAddr)
+	go func() {
+		if err := discoveryServer.Start(); err != nil {
+			log.Fatalf("Discovery server failed: %v", err)
+		}
+	}()
+
+	time.Sleep(1 * time.Second)
+
 	nodes := make([]*node.Node, numNodes)
+	discoveryClients := make([]*discovery.DiscoveryClient, numNodes)
 
 	fmt.Println("Starting distributed counter with", numNodes, "nodes")
-
 	for i := range numNodes {
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-
 		transport, err := protocol.NewTCPTransport(addr)
 		if err != nil {
 			log.Fatalf("Failed to create transport for node %d: %v", i, err)
 		}
+
 		peerManager := peer.NewPeerManager()
 		config := node.Config{
 			Addr:         addr,
@@ -45,26 +62,30 @@ func main() {
 		}
 
 		nodes[i] = n
-		fmt.Printf("Node %d started at %s\n", i, addr)
-	}
 
-	fmt.Println("Building network topology...")
+		discoveryClients[i] = discovery.NewDiscoveryClient(discoveryServerAddr, n)
 
-	for i, node := range nodes {
-		for j := range numNodes {
-			if i != j { // Don't add itself as a peer
-				peerAddr := fmt.Sprintf("127.0.0.1:%d", basePort+j)
-				node.GetPeerManager().AddPeer(peerAddr)
-				fmt.Printf("Node %d connected to peer at %s\n", i, peerAddr)
-			}
+		if err := discoveryClients[i].Start(discoveryInterval, heartbeatInterval); err != nil {
+			log.Fatalf("Failed to start discovery client for node %d: %v", i, err)
 		}
+
+		fmt.Printf("Node %d started at %s and registered with discovery server\n", i, addr)
 	}
 
-	// Increment counter on first node a few times
+	fmt.Println("\nWaiting for initial peer discovery...")
+	time.Sleep(discoveryInterval * 2)
+
+	fmt.Println("\nInitial peer connections:")
+	for i, n := range nodes {
+		peers := n.GetPeerManager().GetPeers()
+		fmt.Printf("Node %d peers: %v\n", i, peers)
+	}
+
 	fmt.Println("\nIncrementing counter on node 0...")
 	for range 5 {
 		nodes[0].Increment()
-		fmt.Printf("Node 0 incremented counter to %d\n", nodes[0].GetCount())
+		fmt.Printf("Node 0 incremented counter to %d (version %d)\n",
+			nodes[0].GetCounter(), nodes[0].GetVersion())
 		time.Sleep(4 * time.Second)
 	}
 
@@ -73,15 +94,14 @@ func main() {
 
 	fmt.Println("\nFinal counter values:")
 	for i, n := range nodes {
-		fmt.Printf("Node %d counter: %d\n", i, n.GetCount())
+		fmt.Printf("Node %d counter: %d (version %d)\n", i, n.GetCounter(), n.GetVersion())
 	}
 
-	gracefulShutdown(nodes)
+	gracefulShutdown(nodes, discoveryClients, discoveryServer)
 }
 
-func gracefulShutdown(nodes []*node.Node) {
+func gracefulShutdown(nodes []*node.Node, clients []*discovery.DiscoveryClient, server *discovery.DiscoveryServer) {
 	sigCh := make(chan os.Signal, 1)
-
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
@@ -91,8 +111,13 @@ func gracefulShutdown(nodes []*node.Node) {
 		fmt.Println("\nTimeout reached, initiating graceful shutdown...")
 	}
 
-	fmt.Println("Closing all node connections...")
+	fmt.Println("Stopping discovery clients...")
+	for i, client := range clients {
+		client.Stop()
+		fmt.Printf("Discovery client %d stopped\n", i)
+	}
 
+	fmt.Println("Closing all node connections...")
 	for i, n := range nodes {
 		if err := n.Close(); err != nil {
 			log.Printf("Error closing node %d: %v", i, err)
@@ -101,5 +126,12 @@ func gracefulShutdown(nodes []*node.Node) {
 		}
 	}
 
-	fmt.Println("All nodes shut down successfully")
+	fmt.Println("Stopping discovery server...")
+	if err := server.Stop(); err != nil {
+		log.Printf("Error stopping discovery server: %v", err)
+	} else {
+		fmt.Println("Discovery server stopped successfully")
+	}
+
+	fmt.Println("All components shut down successfully")
 }

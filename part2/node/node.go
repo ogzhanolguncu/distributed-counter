@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
-	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -159,9 +159,8 @@ func (n *Node) pullState() {
 
 	numPeers := min(n.config.MaxSyncPeers, len(peers))
 	selectedPeers := make([]string, 0, len(peers))
-	for _, peer := range peers {
-		selectedPeers = append(selectedPeers, peer)
-	}
+	selectedPeers = append(selectedPeers, peers...)
+
 	rand.Shuffle(len(selectedPeers), func(i, j int) {
 		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
 	})
@@ -246,8 +245,16 @@ func (n *Node) Decrement() {
 	n.broadcastUpdate()
 }
 
-func (n *Node) GetCount() uint64 {
+func (n *Node) GetCounter() uint64 {
 	return n.state.counter.Load()
+}
+
+func (n *Node) GetVersion() uint64 {
+	return n.state.counter.Load()
+}
+
+func (n *Node) GetAddr() string {
+	return n.config.Addr
 }
 
 func (n *Node) Close() error {

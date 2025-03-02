@@ -29,6 +29,12 @@ func (pm *PeerManager) RemovePeer(addr string) {
 	delete(pm.peers, addr)
 }
 
+func (pm *PeerManager) ClearPeers() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	clear(pm.peers)
+}
+
 func (pm *PeerManager) GetPeers() []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
