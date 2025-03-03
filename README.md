@@ -15,7 +15,7 @@ This blog series walks through building a complete distributed counter system fr
 - **Part 2: Peer Discovery Service**  
   Building a discovery mechanism to help nodes find each other in the network.
 
-- **Part 3: Consistency & Recoverability**  
+~~- **Part 3: Consistency & Recoverability**~~ *not final*
   Ensuring data consistency across the distributed system and handling node failures.
 
 ## System Architecture
