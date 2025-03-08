@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -59,10 +60,6 @@ func waitForServer(addr string, timeout time.Duration) bool {
 }
 
 func TestDiscoveryClientIntegration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
 	serverAddr := getFreePort()
 	cleanupInterval := 5 * time.Second
 	server := NewDiscoveryServer(serverAddr, cleanupInterval)
@@ -97,10 +94,7 @@ func TestDiscoveryClientIntegration(t *testing.T) {
 		err = client2.Register()
 		require.NoError(t, err)
 
-		discoveryInterval := 100 * time.Millisecond
-		client2.StartDiscovery(discoveryInterval)
-
-		time.Sleep(discoveryInterval * 3)
+		client2.discoverPeers()
 
 		peers := node2.GetPeerManager().GetPeers()
 		assert.Contains(t, peers, node1.GetAddr(), "Node2 should discover Node1")
@@ -224,4 +218,75 @@ func TestConcurrentRegistrations(t *testing.T) {
 			clients[i].Stop()
 		}
 	})
+}
+
+func TestLateJoinerDiscovery(t *testing.T) {
+	serverAddr := getFreePort()
+	cleanupInterval := 5 * time.Second
+	server := NewDiscoveryServer(serverAddr, cleanupInterval)
+
+	go func() {
+		err := server.Start()
+		if err != nil && err != http.ErrServerClosed {
+			t.Errorf("Server failed: %v", err)
+		}
+	}()
+	defer server.Stop()
+
+	if !waitForServer(serverAddr, 5*time.Second) {
+		t.Fatal("Server didn't start in time")
+	}
+
+	numInitialNodes := 3
+	initialNodes := make([]*node.Node, numInitialNodes)
+	initialClients := make([]*DiscoveryClient, numInitialNodes)
+
+	for i := range numInitialNodes {
+		initialNodes[i] = createTestNode(t, getFreePort(), 1*time.Second)
+		initialClients[i] = NewDiscoveryClient(serverAddr, initialNodes[i])
+
+		err := initialClients[i].Register()
+		require.NoError(t, err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	for i := range numInitialNodes {
+		initialClients[i].discoverPeers()
+	}
+
+	time.Sleep(1 * time.Second)
+
+	for i := range numInitialNodes {
+		peers := initialNodes[i].GetPeerManager().GetPeers()
+		t.Logf("Node %d peers: %v", i, peers)
+		assert.Equal(t, numInitialNodes-1, len(peers),
+			fmt.Sprintf("Initial node %d should know about all other initial nodes", i))
+	}
+
+	lateNode := createTestNode(t, getFreePort(), 1*time.Second)
+	lateNodeClient := NewDiscoveryClient(serverAddr, lateNode)
+
+	err := lateNodeClient.Register()
+	require.NoError(t, err)
+
+	lateNodeClient.discoverPeers()
+
+	lateNode.Increment()
+	time.Sleep(2 * time.Second)
+
+	lateNodeAddr := lateNode.GetAddr()
+	lateJoinerFound := false
+
+	for i := range numInitialNodes {
+		peers := initialNodes[i].GetPeerManager().GetPeers()
+		t.Logf("Node %d peers after late joiner: %v", i, peers)
+
+		if slices.Contains(peers, lateNodeAddr) {
+			lateJoinerFound = true
+			break
+		}
+	}
+
+	assert.True(t, lateJoinerFound, "At least one initial node should have added the late joiner")
 }

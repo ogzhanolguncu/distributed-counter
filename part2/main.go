@@ -20,7 +20,6 @@ const (
 	maxSyncPeers        = 2
 	basePort            = 9000
 	discoveryServerPort = 8000
-	discoveryInterval   = 3 * time.Second
 	heartbeatInterval   = 1 * time.Second
 	cleanupInterval     = 5 * time.Second
 )
@@ -62,18 +61,14 @@ func main() {
 		}
 
 		nodes[i] = n
-
 		discoveryClients[i] = discovery.NewDiscoveryClient(discoveryServerAddr, n)
 
-		if err := discoveryClients[i].Start(discoveryInterval, heartbeatInterval); err != nil {
+		if err := discoveryClients[i].Start(heartbeatInterval); err != nil {
 			log.Fatalf("Failed to start discovery client for node %d: %v", i, err)
 		}
 
 		fmt.Printf("Node %d started at %s and registered with discovery server\n", i, addr)
 	}
-
-	fmt.Println("\nWaiting for initial peer discovery...")
-	time.Sleep(discoveryInterval * 2)
 
 	fmt.Println("\nInitial peer connections:")
 	for i, n := range nodes {

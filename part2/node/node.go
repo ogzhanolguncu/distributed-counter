@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -247,6 +248,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
+
+	if !slices.Contains(n.peers.GetPeers(), inc.addr) {
+		n.peers.AddPeer(inc.addr)
+	}
 
 	switch inc.message.Type {
 	case protocol.MessageTypePull:

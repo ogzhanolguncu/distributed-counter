@@ -38,8 +38,7 @@ func NewDiscoveryClient(srvAddr string, node *node.Node) *DiscoveryClient {
 	return client
 }
 
-func (dc *DiscoveryClient) Start(discoveryInterval, heartbeatInterval time.Duration) error {
-	assertions.Assert(discoveryInterval > 0, "discovery interval must be positive")
+func (dc *DiscoveryClient) Start(heartbeatInterval time.Duration) error {
 	assertions.Assert(heartbeatInterval > 0, "heartbeat interval must be positive")
 	assertions.AssertNotNil(dc.node, "node cannot be nil")
 
@@ -47,7 +46,7 @@ func (dc *DiscoveryClient) Start(discoveryInterval, heartbeatInterval time.Durat
 		return fmt.Errorf("failed to register with discovery server: %w", err)
 	}
 
-	dc.StartDiscovery(discoveryInterval)
+	dc.discoverPeers()
 	dc.StartHeartbeat(heartbeatInterval)
 	return nil
 }
@@ -58,25 +57,6 @@ func (dc *DiscoveryClient) Stop() {
 
 	close(dc.done)
 	dc.httpClient.CloseIdleConnections()
-}
-
-func (dc *DiscoveryClient) StartDiscovery(discoveryInterval time.Duration) {
-	assertions.Assert(discoveryInterval > 0, "discovery interval must be positive")
-	assertions.AssertNotNil(dc.done, "done channel cannot be nil")
-
-	discoveryTicker := time.NewTicker(discoveryInterval)
-
-	go func() {
-		for {
-			select {
-			case <-discoveryTicker.C:
-				dc.discoverPeers()
-			case <-dc.done:
-				discoveryTicker.Stop()
-				return
-			}
-		}
-	}()
 }
 
 func (dc *DiscoveryClient) Register() error {
