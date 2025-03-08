@@ -77,24 +77,26 @@ func waitForConvergence(t *testing.T, nodes []*Node, expectedCounter uint64, exp
 		expectedCounter, expectedVersion)
 }
 
-func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node {
+func createTestNode(t *testing.T, addr string, syncInterval time.Duration, maxPeerFail int, failureDuration time.Duration) *Node {
 	transport := NewMemoryTransport(addr)
 	config := Config{
-		Addr:         addr,
-		SyncInterval: syncInterval,
-		MaxSyncPeers: 2,
+		Addr:                addr,
+		SyncInterval:        syncInterval,
+		MaxSyncPeers:        2,
+		MaxConsecutiveFails: maxPeerFail,
+		FailureTimeout:      failureDuration,
 	}
 
-	peerManager := peer.NewPeerManager()
+	peerManager := peer.NewPeerManager(maxPeerFail, failureDuration)
 	node, err := NewNode(config, transport, peerManager)
 	require.NoError(t, err)
 	return node
 }
 
 func TestNodeBasicOperation(t *testing.T) {
-	node1 := createTestNode(t, "node1", 100*time.Millisecond)
-	node2 := createTestNode(t, "node2", 100*time.Millisecond)
-	node3 := createTestNode(t, "node3", 100*time.Millisecond)
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 2*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 2*time.Second)
+	node3 := createTestNode(t, "node3", 100*time.Millisecond, 1, 2*time.Second)
 
 	node1.peers.AddPeer("node2")
 	node1.peers.AddPeer("node3")
@@ -117,8 +119,8 @@ func TestNodeBasicOperation(t *testing.T) {
 }
 
 func TestNodeStateConvergence(t *testing.T) {
-	node1 := createTestNode(t, "node1", 100*time.Millisecond)
-	node2 := createTestNode(t, "node2", 100*time.Millisecond)
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 2*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 2*time.Second)
 
 	node1.peers.AddPeer("node2")
 	node2.peers.AddPeer("node1")
@@ -136,8 +138,8 @@ func TestNodeStateConvergence(t *testing.T) {
 }
 
 func TestNodeLateJoiner(t *testing.T) {
-	node1 := createTestNode(t, "node1", 100*time.Millisecond)
-	node2 := createTestNode(t, "node2", 100*time.Millisecond)
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 2*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 2*time.Second)
 
 	node1.state.counter.Store(100)
 	node1.state.version.Store(5)
@@ -153,9 +155,9 @@ func TestNodeLateJoiner(t *testing.T) {
 }
 
 func TestConcurrentUpdates(t *testing.T) {
-	node1 := createTestNode(t, "node1", 100*time.Millisecond)
-	node2 := createTestNode(t, "node2", 100*time.Millisecond)
-	node3 := createTestNode(t, "node3", 100*time.Millisecond)
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 2*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 2*time.Second)
+	node3 := createTestNode(t, "node3", 100*time.Millisecond, 1, 2*time.Second)
 
 	node1.peers.AddPeer("node2")
 	node1.peers.AddPeer("node3")
@@ -197,14 +199,14 @@ func TestConcurrentUpdates(t *testing.T) {
 }
 
 func TestMessageDropping(t *testing.T) {
-	node1 := createTestNode(t, "node1", 100*time.Millisecond)
-	node2 := createTestNode(t, "node2", 100*time.Millisecond)
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 2*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 2*time.Second)
 
 	node1.peers.AddPeer("node2")
 	node2.peers.AddPeer("node1")
 
 	// Fill up the message buffer to force drops
-	for i := 0; i < defaultChannelBuffer+10; i++ {
+	for range defaultChannelBuffer + 10 {
 		node1.incomingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
@@ -229,13 +231,13 @@ func TestRingTopology(t *testing.T) {
 	numNodes := 10
 	nodes := make([]*Node, numNodes)
 
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		addr := fmt.Sprintf("node%d", i)
-		nodes[i] = createTestNode(t, addr, 100*time.Millisecond)
+		nodes[i] = createTestNode(t, addr, 100*time.Millisecond, 1, 10*time.Second)
 		defer nodes[i].Close()
 	}
 
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		prevIdx := (i - 1 + numNodes) % numNodes
 		nextIdx := (i + 1) % numNodes
 
@@ -248,7 +250,48 @@ func TestRingTopology(t *testing.T) {
 
 	waitForConvergence(t, nodes, 42, 1, 5*time.Second)
 
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		nodes[i].Close()
 	}
+	time.Sleep(200 * time.Millisecond)
+}
+
+func TestMessageInactiveNode(t *testing.T) {
+	node1 := createTestNode(t, "node1", 100*time.Millisecond, 1, 10*time.Second)
+	node2 := createTestNode(t, "node2", 100*time.Millisecond, 1, 10*time.Second)
+	node3 := createTestNode(t, "node3", 100*time.Millisecond, 1, 10*time.Second)
+
+	node1.peers.AddPeer("node2")
+	node1.peers.AddPeer("node3")
+	node2.peers.AddPeer("node1")
+	node2.peers.AddPeer("node3")
+	node3.peers.AddPeer("node1")
+	node3.peers.AddPeer("node2")
+
+	node1.Increment()
+
+	waitForConvergence(t, []*Node{node1, node2, node3}, 1, 1, 2*time.Second)
+
+	node3.Close()
+
+	node1.Increment()
+
+	waitForConvergence(t, []*Node{node1, node2}, 2, 2, 2*time.Second)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		peers := node1.peers.GetPeers()
+		if len(peers) == 1 && peers[0] == "node2" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	peers := node1.peers.GetPeers()
+	require.Equal(t, 1, len(peers), "node1 should have exactly one active peer")
+	require.Equal(t, "node2", peers[0], "node2 should be the only active peer")
+
+	node1.Close()
+	node2.Close()
+	time.Sleep(200 * time.Millisecond)
 }

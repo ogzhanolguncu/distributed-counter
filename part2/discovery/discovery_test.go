@@ -22,11 +22,13 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *node
 	transport, err := protocol.NewTCPTransport(addr)
 	require.NoError(t, err, "Failed to start TCP Transport")
 	config := node.Config{
-		Addr:         addr,
-		SyncInterval: syncInterval,
-		MaxSyncPeers: 2,
+		Addr:                addr,
+		SyncInterval:        syncInterval,
+		MaxSyncPeers:        2,
+		MaxConsecutiveFails: 1,
+		FailureTimeout:      10 * time.Second,
 	}
-	peerManager := peer.NewPeerManager()
+	peerManager := peer.NewPeerManager(1, 10*time.Second)
 	node, err := node.NewNode(config, transport, peerManager)
 	require.NoError(t, err)
 	return node

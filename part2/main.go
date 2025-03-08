@@ -22,6 +22,8 @@ const (
 	discoveryServerPort = 8000
 	heartbeatInterval   = 1 * time.Second
 	cleanupInterval     = 5 * time.Second
+	maxConsecutiveFails = 5
+	failureTimeout      = 30 * time.Second
 )
 
 func main() {
@@ -48,11 +50,13 @@ func main() {
 			log.Fatalf("Failed to create transport for node %d: %v", i, err)
 		}
 
-		peerManager := peer.NewPeerManager()
+		peerManager := peer.NewPeerManager(maxConsecutiveFails, failureTimeout)
 		config := node.Config{
-			Addr:         addr,
-			SyncInterval: syncInterval,
-			MaxSyncPeers: maxSyncPeers,
+			Addr:                addr,
+			SyncInterval:        syncInterval,
+			MaxSyncPeers:        maxSyncPeers,
+			MaxConsecutiveFails: maxConsecutiveFails,
+			FailureTimeout:      failureTimeout,
 		}
 
 		n, err := node.NewNode(config, transport, peerManager)

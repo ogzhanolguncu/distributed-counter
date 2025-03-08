@@ -18,9 +18,11 @@ import (
 const defaultChannelBuffer = 100
 
 type Config struct {
-	Addr         string
-	SyncInterval time.Duration
-	MaxSyncPeers int
+	Addr                string
+	SyncInterval        time.Duration
+	MaxSyncPeers        int
+	MaxConsecutiveFails int
+	FailureTimeout      time.Duration
 }
 
 type State struct {
@@ -52,6 +54,8 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	ctx, cancel := context.WithCancel(context.Background())
 
 	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
+	assertions.Assert(config.FailureTimeout > 0, "failure timeout must be positive")
+	assertions.Assert(config.MaxConsecutiveFails > 0, "max consecutive fails must be positive")
 	assertions.Assert(config.MaxSyncPeers > 0, "max sync peers must be positive")
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
@@ -80,7 +84,23 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	}
 
 	go node.eventLoop()
+	go node.pruneStaleNodes()
+
 	return node, nil
+}
+
+func (n *Node) pruneStaleNodes() {
+	ticker := time.NewTicker(n.config.FailureTimeout / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.peers.PruneStalePeers()
+		case <-n.ctx.Done():
+			return
+		}
+	}
 }
 
 func (n *Node) startTransport() error {
@@ -135,6 +155,14 @@ func (n *Node) eventLoop() {
 			if err := n.transport.Send(msg.addr, encodedMsg); err != nil {
 				log.Printf("[Node %s] Failed to send message to %s: %v",
 					n.config.Addr, msg.addr, err)
+
+				if n.peers.MarkPeerFailed(msg.addr) {
+					log.Printf("[Node %s] Peer %s is now considered inactive after %d consecutive failures",
+						n.config.Addr, msg.addr, n.config.MaxConsecutiveFails)
+				}
+
+			} else {
+				n.peers.MarkPeerActive(msg.addr)
 			}
 
 		case <-n.syncTick:
@@ -249,8 +277,11 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
+	// This is required for nodes that joined after that missed initial discovery
 	if !slices.Contains(n.peers.GetPeers(), inc.addr) {
 		n.peers.AddPeer(inc.addr)
+	} else {
+		n.peers.MarkPeerActive(inc.addr)
 	}
 
 	switch inc.message.Type {
