@@ -76,12 +76,17 @@ func OpenWAL(directory string, enableFsync bool, maxFileSize int64) (*WAL, error
 		filePath = filepath.Join(directory, segmentPrefix+"0")
 	}
 
-	// Check if file exists
+	// Try to recover from existing segments
 	if _, err := os.Stat(filePath); err == nil {
-		// Files exists try to recover from it
 		validEntries, lastValidSeq, err := performRecovery(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("recover failed: %v", err)
+			if len(validEntries) > 0 {
+				if err := rewriteWithValidEntries(filePath, validEntries); err != nil {
+					return nil, fmt.Errorf("failed to repair WAL during recovery: %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("recover failed: %v", err)
+			}
 		}
 
 		// If we find a corruption, get rid of it then rewrite with valid entries
