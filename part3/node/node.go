@@ -2,20 +2,52 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
-	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part3/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part3/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part3/wal"
 	"golang.org/x/sync/errgroup"
 )
 
-const defaultChannelBuffer = 100
+const (
+	defaultChannelBuffer = 100
+	defaultMaxFileSize   = 64 * 1024 * 1024 // 64MB
+	defaultWalDir        = "wal"
+)
+
+type OperationType string
+
+const (
+	OpIncrement OperationType = "increment"
+	OpDecrement OperationType = "decrement"
+	OpUpdate    OperationType = "update"
+)
+
+type NodeState struct {
+	Counter uint64 `json:"counter"`
+	Version uint32 `json:"version"`
+}
+
+type WalEntry struct {
+	Operation OperationType `json:"operation"`
+	Counter   uint64        `json:"counter"`
+	Version   uint32        `json:"version"`
+	Timestamp int64         `json:"timestamp"`
+}
+
+type State struct {
+	counter atomic.Uint64
+	version atomic.Uint32
+}
 
 type Config struct {
 	Addr                string
@@ -23,11 +55,10 @@ type Config struct {
 	MaxSyncPeers        int
 	MaxConsecutiveFails int
 	FailureTimeout      time.Duration
-}
-
-type State struct {
-	counter atomic.Uint64
-	version atomic.Uint32
+	WalDir              string
+	EnableWal           bool
+	EnableWalFsync      bool
+	MaxWalFileSize      int64
 }
 
 type MessageInfo struct {
@@ -48,6 +79,8 @@ type Node struct {
 	incomingMsg chan MessageInfo
 	outgoingMsg chan MessageInfo
 	syncTick    <-chan time.Time
+
+	wal *wal.WAL
 }
 
 func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
@@ -60,6 +93,14 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 	assertions.AssertNotNil(peerManager, "peer manager cannot be nil")
+
+	if config.WalDir == "" && config.EnableWal {
+		config.WalDir = filepath.Join(defaultWalDir, config.Addr)
+	}
+
+	if config.MaxWalFileSize <= 0 && config.EnableWal {
+		config.MaxWalFileSize = defaultMaxFileSize
+	}
 
 	node := &Node{
 		config:    config,
@@ -78,8 +119,19 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	assertions.AssertNotNil(node.ctx, "node context must be initialized")
 	assertions.AssertNotNil(node.cancel, "node cancel function must be initialized")
 
+	// Setup WAL if enabled
+	if config.EnableWal {
+		if err := node.setupWAL(); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to setup WAL: %w", err)
+		}
+	}
+
 	if err := node.startTransport(); err != nil {
 		cancel() // Clean up if we fail to start
+		if node.wal != nil {
+			node.wal.Close()
+		}
 		return nil, err
 	}
 
@@ -87,6 +139,112 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	go node.pruneStaleNodes()
 
 	return node, nil
+}
+
+func (n *Node) setupWAL() error {
+	walInstance, err := wal.OpenWAL(n.config.WalDir, n.config.EnableWalFsync, n.config.MaxWalFileSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	n.wal = walInstance
+
+	if err := n.restoreFromWAL(); err != nil {
+		log.Printf("[Node %s] Warning: Failed to restore from WAL: %v", n.config.Addr, err)
+	}
+
+	return nil
+}
+
+func (n *Node) restoreFromWAL() error {
+	if n.wal == nil {
+		return fmt.Errorf("WAL not initialized")
+	}
+
+	entries, err := n.wal.ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to read from WAL: %w", err)
+	}
+
+	if len(entries) == 0 {
+		log.Printf("[Node %s] No entries in WAL to restore", n.config.Addr)
+		return nil
+	}
+
+	// Replay the WAL entries to reconstruct state
+	var highestVersion uint32 = 0
+	var finalCounter uint64 = 0
+	var lastAppliedSeq uint64 = 0
+
+	// First pass: find the highest sequence we've seen
+	for _, entry := range entries {
+		if entry.SequenceNumber > lastAppliedSeq {
+			lastAppliedSeq = entry.SequenceNumber
+		}
+	}
+
+	// Second pass: apply operations in order
+	for _, entry := range entries {
+		var walEntry WalEntry
+		if err := json.Unmarshal(entry.Data, &walEntry); err != nil {
+			// Try the old format for backward compatibility
+			var oldState NodeState
+			if err := json.Unmarshal(entry.Data, &oldState); err != nil {
+				log.Printf("[Node %s] Warning: Failed to decode WAL entry: %v", n.config.Addr, err)
+				continue
+			}
+
+			// Use the highest version state from old format
+			if oldState.Version > highestVersion {
+				highestVersion = oldState.Version
+				finalCounter = oldState.Counter
+			}
+			continue
+		}
+
+		switch walEntry.Operation {
+		case OpIncrement:
+			finalCounter++
+			highestVersion = walEntry.Version
+		case OpDecrement:
+			finalCounter--
+			highestVersion = walEntry.Version
+		case OpUpdate:
+			finalCounter = walEntry.Counter
+			highestVersion = walEntry.Version
+		}
+	}
+
+	n.state.version.Store(highestVersion)
+	n.state.counter.Store(finalCounter)
+
+	log.Printf("[Node %s] Restored from WAL: version=%d, counter=%d",
+		n.config.Addr, highestVersion, finalCounter)
+
+	return nil
+}
+
+func (n *Node) logOperation(opType OperationType, counter uint64, version uint32) error {
+	if n.wal == nil {
+		return nil // WAL not enabled, silently succeed
+	}
+
+	walEntry := WalEntry{
+		Operation: opType,
+		Counter:   counter,
+		Version:   version,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	data, err := json.Marshal(walEntry)
+	if err != nil {
+		return fmt.Errorf("failed to encode operation: %w", err)
+	}
+
+	if err := n.wal.WriteEntry(data); err != nil {
+		return fmt.Errorf("failed to write to WAL: %w", err)
+	}
+
+	return nil
 }
 
 func (n *Node) pruneStaleNodes() {
@@ -210,8 +368,6 @@ func (n *Node) broadcastUpdate() {
 	}
 }
 
-// We periodically pull other node's states. This is also called "Anti-entropy".
-// This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
 	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
 
@@ -277,7 +433,7 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
-	// This is required for nodes that joined after that missed initial discovery
+	// Add new peers that were not previously known
 	if !slices.Contains(n.peers.GetPeers(), inc.addr) {
 		n.peers.AddPeer(inc.addr)
 	} else {
@@ -287,15 +443,22 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	switch inc.message.Type {
 	case protocol.MessageTypePull:
 		if inc.message.Version > n.state.version.Load() {
+			if err := n.logOperation(OpUpdate, inc.message.Counter, inc.message.Version); err != nil {
+				log.Printf("[Node %s] Failed to log update operation to WAL: %v", n.config.Addr, err)
+				// Continue with the operation anyway as we already have the data from peer
+			}
+
 			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
 			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
+
 			n.broadcastUpdate()
 		}
 
 		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
 			n.config.Addr, inc.addr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
+
 		n.outgoingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
@@ -304,12 +467,19 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			},
 			addr: inc.addr,
 		}
+
 	case protocol.MessageTypePush:
 		if inc.message.Version > n.state.version.Load() {
+			if err := n.logOperation(OpUpdate, inc.message.Counter, inc.message.Version); err != nil {
+				log.Printf("[Node %s] Failed to log update operation to WAL: %v", n.config.Addr, err)
+				// Continue with the operation anyway as we already have the data from peer
+			}
+
 			oldVersion := n.state.version.Load()
 			n.state.version.Store(inc.message.Version)
 			n.state.counter.Store(inc.message.Counter)
 			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
+
 			n.broadcastUpdate()
 		}
 	}
@@ -324,6 +494,12 @@ func (n *Node) Increment() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	oldCounter := n.state.counter.Load()
 	oldVersion := n.state.version.Load()
+	newVersion := oldVersion + 1
+
+	if err := n.logOperation(OpIncrement, oldCounter+1, newVersion); err != nil {
+		log.Printf("[Node %s] Failed to log increment operation to WAL: %v", n.config.Addr, err)
+		return
+	}
 
 	n.state.counter.Add(1)
 	n.state.version.Add(1)
@@ -338,8 +514,14 @@ func (n *Node) Decrement() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
 	oldCounter := n.state.counter.Load()
 	oldVersion := n.state.version.Load()
+	newVersion := oldVersion + 1
 
-	n.state.counter.Add(^uint64(0))
+	if err := n.logOperation(OpDecrement, oldCounter-1, newVersion); err != nil {
+		log.Printf("[Node %s] Failed to log decrement operation to WAL: %v", n.config.Addr, err)
+		return
+	}
+
+	n.state.counter.Add(^uint64(0)) // Subtract 1
 	n.state.version.Add(1)
 
 	assertions.Assert(n.state.counter.Load() < oldCounter, "counter must decrease after Decrement")
@@ -368,5 +550,12 @@ func (n *Node) Close() error {
 	assertions.AssertNotNil(n.transport, "transport cannot be nil")
 
 	n.cancel()
+
+	if n.wal != nil {
+		if err := n.wal.Close(); err != nil {
+			log.Printf("[Node %s] Error closing WAL: %v", n.config.Addr, err)
+		}
+	}
+
 	return n.transport.Close()
 }

@@ -227,9 +227,16 @@ func (wal *WAL) Close() error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	select {
+	case <-wal.done:
+		return nil
+	default:
+	}
+
 	if err := wal.Sync(); err != nil {
 		return err
 	}
+
 	close(wal.done)
 	return wal.crrSeg.Close()
 }

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
 )
 
 type DiscoveryServer struct {
