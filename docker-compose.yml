@@ -1,0 +1,163 @@
+version: "3.8"
+
+services:
+  gateway:
+    build: .
+    command:
+      [
+        "/bin/gateway",
+        "-port=8080",
+        "-discovery=discovery:8000",
+        "-refresh=10s",
+      ]
+    ports:
+      - "8080:8080"
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  discovery:
+    build: .
+    command: ["/bin/discovery-server", "-port=8000", "-cleanup=5s"]
+    ports:
+      - "8000:8000"
+    networks:
+      - gossip-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/peers"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  node1:
+    build: .
+    command:
+      [
+        "/bin/counter-node",
+        "-addr=node1:9000",
+        "-discovery=discovery:8000",
+        "-sync=2s",
+        "-heartbeat=1s",
+        "-wal-dir=/data/wal/node1",
+        "-http-port=8010",
+      ]
+    hostname: node1
+    expose:
+      - "8010"
+      - "9000"
+    volumes:
+      - node1_data:/data
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  node2:
+    build: .
+    command:
+      [
+        "/bin/counter-node",
+        "-addr=node2:9000",
+        "-discovery=discovery:8000",
+        "-sync=2s",
+        "-heartbeat=1s",
+        "-wal-dir=/data/wal/node2",
+        "-http-port=8011",
+      ]
+    hostname: node2
+    expose:
+      - "8011"
+      - "9000"
+    volumes:
+      - node2_data:/data
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  node3:
+    build: .
+    command:
+      [
+        "/bin/counter-node",
+        "-addr=node3:9000",
+        "-discovery=discovery:8000",
+        "-sync=2s",
+        "-heartbeat=1s",
+        "-wal-dir=/data/wal/node3",
+        "-http-port=8012",
+      ]
+    hostname: node3
+    expose:
+      - "8012"
+      - "9000"
+    volumes:
+      - node3_data:/data
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  node4:
+    build: .
+    command:
+      [
+        "/bin/counter-node",
+        "-addr=node4:9000",
+        "-discovery=discovery:8000",
+        "-sync=2s",
+        "-heartbeat=1s",
+        "-wal-dir=/data/wal/node4",
+        "-http-port=8013",
+      ]
+    hostname: node4
+    expose:
+      - "8013"
+      - "9000"
+    volumes:
+      - node4_data:/data
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  node5:
+    build: .
+    command:
+      [
+        "/bin/counter-node",
+        "-addr=node5:9000",
+        "-discovery=discovery:8000",
+        "-sync=2s",
+        "-heartbeat=1s",
+        "-wal-dir=/data/wal/node5",
+        "-http-port=8014",
+      ]
+    hostname: node5
+    expose:
+      - "8014"
+      - "9000"
+    volumes:
+      - node5_data:/data
+    networks:
+      - gossip-network
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+networks:
+  gossip-network:
+    driver: bridge
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+  node4_data:
+  node5_data:

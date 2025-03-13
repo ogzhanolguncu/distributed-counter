@@ -44,6 +44,9 @@ func main() {
 	walDir := flag.String("wal-dir", "", "WAL directory (defaults to data/wal/<node-addr>)")
 	maxWalFileSize := flag.Int64("wal-max-size", defaultMaxWalFileSize, "Maximum WAL file size before rotation")
 
+	// HTTP server options
+	httpPort := flag.Int("http-port", 0, "HTTP server port (defaults to 8010 + (TCP port - 9000))")
+
 	flag.Parse()
 
 	// If WAL directory not specified, use default
@@ -98,7 +101,7 @@ func main() {
 	}
 
 	// Setup HTTP handlers for interaction
-	setupHTTPHandlers(n)
+	setupHTTPHandlers(n, *httpPort)
 
 	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -114,7 +117,7 @@ func main() {
 	}
 }
 
-func setupHTTPHandlers(n *node.Node) {
+func setupHTTPHandlers(n *node.Node, configuredHttpPort int) {
 	http.HandleFunc("/increment", func(w http.ResponseWriter, r *http.Request) {
 		n.Increment()
 		fmt.Fprintf(w, "Counter incremented to %d (version %d)\n", n.GetCounter(), n.GetVersion())
@@ -135,12 +138,23 @@ func setupHTTPHandlers(n *node.Node) {
 	})
 
 	go func() {
+		httpPort := configuredHttpPort
 		addr := n.GetAddr()
-		httpPort := 8080
-		if _, err := fmt.Sscanf(addr, "localhost:%d", &httpPort); err == nil {
-			httpPort = 8010 + (httpPort - 9000)
+
+		// If HTTP port not explicitly set, calculate it
+		if httpPort == 0 {
+			var tcpPort int
+			_, err := fmt.Sscanf(addr, "%*[^:]:%d", &tcpPort)
+			if err == nil {
+				httpPort = 8010 + (tcpPort - 9000)
+			} else {
+				httpPort = 8010 // Default if parsing fails
+			}
 		}
-		httpAddr := fmt.Sprintf(":%d", httpPort)
+
+		// Always bind to 0.0.0.0 in Docker environment
+		httpAddr := fmt.Sprintf("0.0.0.0:%d", httpPort)
+
 		log.Printf("Starting HTTP server at %s", httpAddr)
 		if err := http.ListenAndServe(httpAddr, nil); err != nil {
 			log.Printf("HTTP server error: %v", err)
