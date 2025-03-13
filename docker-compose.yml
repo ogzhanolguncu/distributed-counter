@@ -1,14 +1,15 @@
 version: "3.8"
-
 services:
   gateway:
     build: .
     command:
       [
         "/bin/gateway",
-        "-port=8080",
-        "-discovery=discovery:8000",
-        "-refresh=10s",
+        "--port=8080",
+        "--discovery=discovery:8000",
+        "--use-service-names=true",
+        "--initial-nodes=node1:9000,node2:9000,node3:9000,node4:9000,node5:9000",
+        "--fixed-http-port=8010",
       ]
     ports:
       - "8080:8080"
