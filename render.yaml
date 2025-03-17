@@ -1,0 +1,75 @@
+services:
+  # Discovery and Gateway Service (public)
+  - type: web
+    name: discovery-gateway
+    env: docker
+    dockerfilePath: ./Dockerfile.gateway
+    dockerContext: .
+    plan: standard
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    ports:
+      - port: 8000
+        name: discovery
+      - port: 8080
+        name: gateway
+    envVars:
+      - key: SERVICE_TYPE
+        value: gateway
+
+  # Node Group 1 (private)
+  - type: web
+    name: nodes-group1
+    env: docker
+    dockerfilePath: ./Dockerfile.node
+    dockerContext: .
+    plan: standard
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    ports:
+      - port: 9001
+      - port: 9002
+      - port: 9003
+    envVars:
+      - key: SERVICE_TYPE
+        value: node
+      - key: NODE_START_PORT
+        value: 9001
+      - key: NODE_COUNT
+        value: 3
+      - key: DISCOVERY_URL
+        fromService:
+          name: discovery-gateway
+          type: web
+          property: host
+          envVarName: DISCOVERY_HOST
+
+  # Node Group 2 (private)
+  - type: web
+    name: nodes-group2
+    env: docker
+    dockerfilePath: ./Dockerfile.node
+    dockerContext: .
+    plan: standard
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    ports:
+      - port: 9004
+      - port: 9005
+      - port: 9006
+    envVars:
+      - key: SERVICE_TYPE
+        value: node
+      - key: NODE_START_PORT
+        value: 9004
+      - key: NODE_COUNT
+        value: 3
+      - key: DISCOVERY_URL
+        fromService:
+          name: discovery-gateway
+          type: web
+          property: host
+          envVarName: DISCOVERY_HOST
