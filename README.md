@@ -7,6 +7,29 @@ This repository contains a step-by-step implementation of a distributed counter 
 ```
                 GOSSIP PROTOCOL ARCHITECTURE
                 ===========================
+                    +----------------+
+                    |    Client      |
+                    +--------+-------+
+                             |
+                             | HTTP
+                             v
+                    +----------------+
+                    |  API Gateway   |
+                    |----------------|
+                    | Load Balancer  |
+                    | Reverse Proxy  |
+                    |----------------|
+                    | Endpoints:     |
+                    | GET  /counter  |
+                    | POST /increment|
+                    | POST /decrement|
+                    | GET  /nodes    |
+                    | GET  /health   |
+                    +--------+-------+
+                             |
+                             | HTTP
+                    +--------+--------+
+                    |                 |
 
 +---------------+             +---------------+             +---------------+
 |    Node 1     |             |    Node 2     |             |    Node 3     |
