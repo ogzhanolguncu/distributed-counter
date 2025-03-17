@@ -1,0 +1,13 @@
+FROM golang:1.23.5 as builder
+
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN go build -o discovery ./part3/cmd/discovery/main.go
+
+FROM debian:bullseye-slim
+WORKDIR /app
+COPY --from=builder /app/discovery /app/
+
+EXPOSE 8000
+CMD ["/app/discovery", "-port", "8000"]

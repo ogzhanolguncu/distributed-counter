@@ -3,16 +3,11 @@ FROM golang:1.23.5 as builder
 WORKDIR /app
 COPY . .
 RUN go mod download
-RUN go build -o discovery ./part3/cmd/discovery/main.go
 RUN go build -o gateway ./part3/cmd/gateway/main.go
 
 FROM debian:bullseye-slim
 WORKDIR /app
-COPY --from=builder /app/discovery /app/
 COPY --from=builder /app/gateway /app/
-COPY ./start-gateway.sh /app/
 
-RUN chmod +x /app/start-gateway.sh
-
-EXPOSE 8000 8080
-CMD ["/app/start-gateway.sh"]
+EXPOSE 8080
+CMD ["/app/gateway", "-discovery", "${DISCOVERY_HOST}:${DISCOVERY_PORT}", "-port", "8080"]

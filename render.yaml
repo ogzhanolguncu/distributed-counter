@@ -1,75 +1,95 @@
 services:
-  # Discovery and Gateway Service (public)
+  # Discovery Server (private service)
+  - type: pserv
+    name: discovery-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile.discovery
+    dockerContext: .
+    plan: standard
+    numInstances: 1
+    envVars:
+      - key: DISCOVERY_PORT
+        value: "8000"
+    buildFilter:
+      paths:
+        - part3/cmd/discovery/**
+        - part3/discovery/**
+
+  # Gateway Service (public)
   - type: web
-    name: discovery-gateway
-    env: docker
+    name: counter-gateway
+    runtime: docker
     dockerfilePath: ./Dockerfile.gateway
     dockerContext: .
     plan: standard
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-    ports:
-      - port: 8000
-        name: discovery
-      - port: 8080
-        name: gateway
+    numInstances: 1
     envVars:
-      - key: SERVICE_TYPE
-        value: gateway
+      - key: PORT
+        value: "8080"
+      - key: DISCOVERY_HOST
+        fromService:
+          name: discovery-server
+          type: pserv
+          property: host
+      - key: DISCOVERY_PORT
+        value: "8000"
+    healthCheckPath: /health
+    buildFilter:
+      paths:
+        - part3/cmd/gateway/**
 
   # Node Group 1 (private)
-  - type: web
+  - type: pserv
     name: nodes-group1
-    env: docker
+    runtime: docker
     dockerfilePath: ./Dockerfile.node
     dockerContext: .
     plan: standard
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-    ports:
-      - port: 9001
-      - port: 9002
-      - port: 9003
+    numInstances: 1
     envVars:
-      - key: SERVICE_TYPE
-        value: node
       - key: NODE_START_PORT
-        value: 9001
+        value: "9001"
       - key: NODE_COUNT
-        value: 3
-      - key: DISCOVERY_URL
+        value: "3"
+      - key: DISCOVERY_HOST
         fromService:
-          name: discovery-gateway
-          type: web
+          name: discovery-server
+          type: pserv
           property: host
-          envVarName: DISCOVERY_HOST
+      - key: DISCOVERY_PORT
+        value: "8000"
+    buildFilter:
+      paths:
+        - part3/cmd/counter/**
+        - part3/node/**
+        - part3/peer/**
+        - part3/protocol/**
+        - part3/wal/**
 
   # Node Group 2 (private)
-  - type: web
+  - type: pserv
     name: nodes-group2
-    env: docker
+    runtime: docker
     dockerfilePath: ./Dockerfile.node
     dockerContext: .
     plan: standard
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-    ports:
-      - port: 9004
-      - port: 9005
-      - port: 9006
+    numInstances: 1
     envVars:
-      - key: SERVICE_TYPE
-        value: node
       - key: NODE_START_PORT
-        value: 9004
+        value: "9004"
       - key: NODE_COUNT
-        value: 3
-      - key: DISCOVERY_URL
+        value: "3"
+      - key: DISCOVERY_HOST
         fromService:
-          name: discovery-gateway
-          type: web
+          name: discovery-server
+          type: pserv
           property: host
-          envVarName: DISCOVERY_HOST
+      - key: DISCOVERY_PORT
+        value: "8000"
+    buildFilter:
+      paths:
+        - part3/cmd/counter/**
+        - part3/node/**
+        - part3/peer/**
+        - part3/protocol/**
+        - part3/wal/**
