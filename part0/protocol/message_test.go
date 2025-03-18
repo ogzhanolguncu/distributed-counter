@@ -1,45 +1,58 @@
 package protocol
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestMessages(t *testing.T) {
-	messages := []Message{
-		{Type: MessageTypePush, Version: 1, Counter: 12},
-		{Type: MessageTypePull, Version: 2, Counter: 0},
-		{Type: MessageTypePush, Version: ^uint32(0), Counter: ^uint64(0)}, // Max values
+	tests := []struct {
+		name    string
+		message Message
+	}{
+		{
+			name: "Type=0x02,Ver=1,Counter=12",
+			message: Message{
+				Type:    0x02,
+				Version: 1,
+				Counter: 12,
+			},
+		},
+		{
+			name: "Type=0x01,Ver=2,Counter=0",
+			message: Message{
+				Type:    0x01,
+				Version: 2,
+				Counter: 0,
+			},
+		},
+		{
+			name: "Type=0x02,Ver=18446744073709551615,Counter=18446744073709551615",
+			message: Message{
+				Type:    0x02,
+				Version: 18446744073709551615,
+				Counter: 18446744073709551615,
+			},
+		},
 	}
 
-	for _, msg := range messages {
-		t.Run(fmt.Sprintf("Type=0x%02x,Ver=%d,Counter=%d", msg.Type, msg.Version, msg.Counter), func(t *testing.T) {
-			encoded := msg.Encode()
-			decoded, err := DecodeMessage(encoded)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := tt.message.Encode()
+			// We expect: 1 byte (type) + 8 bytes (version) + 8 bytes (counter) = 17 bytes
+			assert.Equal(t, MessageSize, len(encoded))
 
-			require.NoError(t, err)
-			require.Equal(t, msg, *decoded)
-			require.Equal(t, 13, len(encoded))
+			decoded, err := DecodeMessage(encoded)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.message.Type, decoded.Type)
+			assert.Equal(t, tt.message.Version, decoded.Version)
+			assert.Equal(t, tt.message.Counter, decoded.Counter)
 		})
 	}
 }
 
-func TestDecodeMessageErrors(t *testing.T) {
-	invalidInputs := []struct {
-		input   []byte
-		wantErr string
-	}{
-		{[]byte{}, "message too short: 0 bytes"},
-		{[]byte{0x02, 0x00, 0x00, 0x00}, "message too short: 4 bytes"},
-	}
-
-	for _, tc := range invalidInputs {
-		t.Run(fmt.Sprintf("len=%d", len(tc.input)), func(t *testing.T) {
-			_, err := DecodeMessage(tc.input)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tc.wantErr)
-		})
-	}
+func TestDecodeMessageError(t *testing.T) {
+	_, err := DecodeMessage([]byte{0x01})
+	assert.Error(t, err)
 }

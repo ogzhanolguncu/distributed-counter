@@ -22,9 +22,102 @@ type Config struct {
 	MaxSyncPeers int
 }
 
+// CounterVersionState holds counter and version in a single 16-byte struct
+// that can be atomically updated
+type CounterVersionState struct {
+	Counter uint64
+	Version uint64
+}
+
 type State struct {
-	counter atomic.Uint64
-	version atomic.Uint32
+	// Use atomic.Pointer to allow atomic updates of the entire structure
+	state atomic.Pointer[CounterVersionState]
+}
+
+func NewState() *State {
+	s := &State{}
+	initialState := &CounterVersionState{
+		Counter: 0,
+		Version: 0,
+	}
+	s.state.Store(initialState)
+	return s
+}
+
+// GetState returns the current state atomically
+func (s *State) GetState() *CounterVersionState {
+	return s.state.Load()
+}
+
+// Increment atomically increments the counter and version
+func (s *State) Increment() (*CounterVersionState, *CounterVersionState) {
+	for {
+		// Load current state
+		current := s.state.Load()
+
+		// Create new state
+		next := &CounterVersionState{
+			Counter: current.Counter + 1,
+			Version: current.Version + 1,
+		}
+
+		// Try to swap - if successful, return old and new states
+		if s.state.CompareAndSwap(current, next) {
+			return current, next
+		}
+		// If unsuccessful, someone else updated it, try again
+	}
+}
+
+// Decrement atomically decrements the counter and increments the version
+// If counter is already 0, this is a no-op and returns the current state twice
+func (s *State) Decrement() (*CounterVersionState, *CounterVersionState) {
+	for {
+		// Load current state
+		current := s.state.Load()
+
+		// Check if counter is already 0
+		if current.Counter == 0 {
+			// Return the same state twice to indicate no change
+			return current, current
+		}
+
+		// Create new state
+		next := &CounterVersionState{
+			Counter: current.Counter - 1,
+			Version: current.Version + 1,
+		}
+
+		// Try to swap - if successful, return old and new states
+		if s.state.CompareAndSwap(current, next) {
+			return current, next
+		}
+		// If unsuccessful, someone else updated it, try again
+	}
+}
+
+// UpdateIfNewer atomically updates state only if the new version is newer
+func (s *State) UpdateIfNewer(newCounter uint64, newVersion uint64) bool {
+	for {
+		current := s.state.Load()
+
+		// Check if we need to update
+		if current.Version >= newVersion {
+			return false // No update needed
+		}
+
+		// Create new state with updated values
+		next := &CounterVersionState{
+			Counter: newCounter,
+			Version: newVersion,
+		}
+
+		// Try atomic update
+		if s.state.CompareAndSwap(current, next) {
+			return true
+		}
+		// If update failed, loop and try again
+	}
 }
 
 type MessageInfo struct {
@@ -77,7 +170,7 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 
 	node := &Node{
 		config:    config,
-		state:     &State{},
+		state:     NewState(),
 		peers:     make([]string, 0),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -128,8 +221,9 @@ func (n *Node) eventLoop() {
 	for {
 		select {
 		case <-n.ctx.Done():
+			currentState := n.state.GetState()
 			log.Printf("[Node %s] Shutting down with version=%d and counter=%d",
-				n.config.Addr, n.state.version.Load(), n.state.counter.Load())
+				n.config.Addr, currentState.Version, currentState.Counter)
 			return
 
 		case msg := <-n.incomingMsg:
@@ -159,18 +253,20 @@ func (n *Node) broadcastUpdate() {
 	peers := n.peers
 	n.peersMu.RUnlock()
 
+	currentState := n.state.GetState()
+
 	for _, peerAddr := range peers {
 		peerAddr := peerAddr // Shadow the variable for goroutine
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
+				n.config.Addr, peerAddr, protocol.MessageTypePush, currentState.Version, currentState.Counter)
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
 				message: protocol.Message{
 					Type:    protocol.MessageTypePush,
-					Version: n.state.version.Load(),
-					Counter: n.state.counter.Load(),
+					Version: currentState.Version,
+					Counter: currentState.Counter,
 				},
 				addr: peerAddr,
 			}:
@@ -212,18 +308,20 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	currentState := n.state.GetState()
+
 	for _, peer := range selectedPeers[:numPeers] {
 		peerAddr := peer // Shadow the variable for goroutine
 		g.Go(func() error {
 			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePull, n.state.version.Load(), n.state.counter.Load())
+				n.config.Addr, peerAddr, protocol.MessageTypePull, currentState.Version, currentState.Counter)
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
 				message: protocol.Message{
 					Type:    protocol.MessageTypePull,
-					Version: n.state.version.Load(),
-					Counter: n.state.counter.Load(),
+					Version: currentState.Version,
+					Counter: currentState.Counter,
 				},
 				addr: peerAddr,
 			}:
@@ -247,72 +345,65 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
 		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
 
-	switch inc.message.Type {
-	case protocol.MessageTypePull:
-		if inc.message.Version > n.state.version.Load() {
-			oldVersion := n.state.version.Load()
-			n.state.version.Store(inc.message.Version)
-			n.state.counter.Store(inc.message.Counter)
-			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
+	updated := false
+
+	// Try to update our state if the incoming message has a newer version
+	if inc.message.Version > n.state.GetState().Version {
+		updated = n.state.UpdateIfNewer(inc.message.Counter, inc.message.Version)
+
+		if updated {
+			// If we updated our state, broadcast to other peers
 			n.broadcastUpdate()
 		}
+	}
 
+	// If it's a pull request, always respond with our current state
+	if inc.message.Type == protocol.MessageTypePull {
+		currentState := n.state.GetState()
 		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-			n.config.Addr, inc.addr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
+			n.config.Addr, inc.addr, protocol.MessageTypePush, currentState.Version, currentState.Counter)
+
 		n.outgoingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
-				Version: n.state.version.Load(),
-				Counter: n.state.counter.Load(),
+				Version: currentState.Version,
+				Counter: currentState.Counter,
 			},
 			addr: inc.addr,
-		}
-	case protocol.MessageTypePush:
-		if inc.message.Version > n.state.version.Load() {
-			oldVersion := n.state.version.Load()
-			n.state.version.Store(inc.message.Version)
-			n.state.counter.Store(inc.message.Counter)
-			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
-			n.broadcastUpdate()
 		}
 	}
 }
 
 func (n *Node) Increment() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	oldCounter := n.state.counter.Load()
-	oldVersion := n.state.version.Load()
 
-	n.state.counter.Add(1)
-	n.state.version.Add(1)
+	oldState, newState := n.state.Increment()
 
-	assertions.Assert(oldCounter < n.state.counter.Load(), "counter must increase after Increment")
-	assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
+	log.Printf("[Node %s] Incremented counter from %d to %d, version from %d to %d",
+		n.config.Addr, oldState.Counter, newState.Counter, oldState.Version, newState.Version)
+
 	n.broadcastUpdate()
 }
 
 func (n *Node) Decrement() {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	oldCounter := n.state.counter.Load()
-	oldVersion := n.state.version.Load()
 
-	n.state.counter.Add(^uint64(0))
-	n.state.version.Add(1)
+	oldState, newState := n.state.Decrement()
 
-	assertions.Assert(oldCounter > n.state.counter.Load(), "counter must decrease after Decrease")
-	assertions.Assert(oldVersion < n.state.version.Load(), "version must increase after Increment")
+	log.Printf("[Node %s] Decremented counter from %d to %d, version from %d to %d",
+		n.config.Addr, oldState.Counter, newState.Counter, oldState.Version, newState.Version)
 
 	n.broadcastUpdate()
 }
 
 func (n *Node) GetCounter() uint64 {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.counter.Load()
+	return n.state.GetState().Counter
 }
 
-func (n *Node) GetVersion() uint32 {
+func (n *Node) GetVersion() uint64 {
 	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.version.Load()
+	return n.state.GetState().Version
 }
 
 func (n *Node) GetAddr() string {

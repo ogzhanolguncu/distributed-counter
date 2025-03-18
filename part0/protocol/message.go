@@ -14,23 +14,22 @@ const (
 
 const (
 	TypeSize    = 1
-	VersionSize = 4
+	VersionSize = 8
 	CounterSize = 8
 	MessageSize = TypeSize + VersionSize + CounterSize
 )
 
 type Message struct {
 	Type    byte
-	Version uint32
+	Version uint64 // Using uint64 for Version (8 bytes)
 	Counter uint64
 }
 
 func (m *Message) Encode() []byte {
-	buf := make([]byte, MessageSize) // 1 byte type + 4 byte version + 8 byte counter
+	buf := make([]byte, MessageSize) // 1 byte type + 8 byte version + 8 byte counter
 	buf[0] = m.Type
-	binary.BigEndian.PutUint32(buf[1:5], m.Version)
-	binary.BigEndian.PutUint64(buf[5:], m.Counter)
-
+	binary.BigEndian.PutUint64(buf[1:9], m.Version)
+	binary.BigEndian.PutUint64(buf[9:], m.Counter)
 	assertions.AssertEqual(MessageSize, len(buf), "encoded message size must match expected size")
 	return buf
 }
@@ -39,11 +38,10 @@ func DecodeMessage(data []byte) (*Message, error) {
 	if len(data) < MessageSize {
 		return nil, fmt.Errorf("message too short: %d bytes", len(data))
 	}
-
 	return &Message{
 		Type:    data[0],
-		Version: binary.BigEndian.Uint32(data[1:5]),
-		Counter: binary.BigEndian.Uint64(data[5:]),
+		Version: binary.BigEndian.Uint64(data[1:9]),
+		Counter: binary.BigEndian.Uint64(data[9:]),
 	}, nil
 }
 

@@ -24,13 +24,27 @@ func NewMemoryTransport(addr string) *MemoryTransport {
 
 func (t *MemoryTransport) Send(addr string, data []byte) error {
 	time.Sleep(10 * time.Millisecond) // Prevent message flood
+
+	// Get the transport while holding the global lock
 	tmu.RLock()
 	transport, exists := transports[addr]
 	tmu.RUnlock()
+
 	if !exists {
 		return fmt.Errorf("transport not found for address: %s", addr)
 	}
-	return transport.handler(t.addr, data)
+
+	// Get the handler while holding the transport's lock
+	transport.mu.RLock()
+	handler := transport.handler
+	transport.mu.RUnlock()
+
+	if handler == nil {
+		return fmt.Errorf("no handler registered for address: %s", addr)
+	}
+
+	// Call the handler outside of any locks
+	return handler(t.addr, data)
 }
 
 func (t *MemoryTransport) Listen(handler func(addr string, data []byte) error) error {
@@ -57,12 +71,14 @@ var (
 	tmu        sync.RWMutex
 )
 
-func waitForConvergence(t *testing.T, nodes []*Node, expectedCounter uint64, expectedVersion uint32, timeout time.Duration) {
+// Updated to work with new State implementation
+func waitForConvergence(t *testing.T, nodes []*Node, expectedCounter uint64, expectedVersion uint64, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		allConverged := true
 		for _, n := range nodes {
-			if n.state.counter.Load() != expectedCounter || n.state.version.Load() != expectedVersion {
+			state := n.state.GetState()
+			if state.Counter != expectedCounter || state.Version != expectedVersion {
 				allConverged = false
 				break
 			}
@@ -89,6 +105,14 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node
 	return node
 }
 
+func setNodeState(node *Node, counter uint64, version uint64) {
+	state := &CounterVersionState{
+		Counter: counter,
+		Version: version,
+	}
+	node.state.state.Store(state)
+}
+
 func TestNodeBasicOperation(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
@@ -98,8 +122,7 @@ func TestNodeBasicOperation(t *testing.T) {
 	node2.SetPeers([]string{"node1", "node3"})
 	node3.SetPeers([]string{"node1", "node2"})
 
-	node1.state.counter.Store(42)
-	node1.state.version.Store(1)
+	setNodeState(node1, 42, 1)
 
 	waitForConvergence(t, []*Node{node1, node2, node3}, 42, 1, 2*time.Second)
 
@@ -116,10 +139,8 @@ func TestNodeStateConvergence(t *testing.T) {
 	node1.SetPeers([]string{"node2"})
 	node2.SetPeers([]string{"node1"})
 
-	node1.state.counter.Store(100)
-	node1.state.version.Store(1)
-	node2.state.counter.Store(50)
-	node2.state.version.Store(2)
+	setNodeState(node1, 100, 1)
+	setNodeState(node2, 50, 2)
 
 	waitForConvergence(t, []*Node{node1, node2}, 50, 2, 2*time.Second)
 
@@ -132,8 +153,7 @@ func TestNodeLateJoiner(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 
-	node1.state.counter.Store(100)
-	node1.state.version.Store(5)
+	setNodeState(node1, 100, 5)
 
 	node1.SetPeers([]string{"node2"})
 	node2.SetPeers([]string{"node1"})
@@ -159,20 +179,17 @@ func TestConcurrentUpdates(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		node1.state.counter.Store(100)
-		node1.state.version.Store(1)
+		setNodeState(node1, 100, 1)
 	}()
 
 	go func() {
 		defer wg.Done()
-		node2.state.counter.Store(200)
-		node2.state.version.Store(2)
+		setNodeState(node2, 200, 2)
 	}()
 
 	go func() {
 		defer wg.Done()
-		node3.state.counter.Store(300)
-		node3.state.version.Store(3)
+		setNodeState(node3, 300, 3)
 	}()
 
 	wg.Wait()
@@ -193,7 +210,7 @@ func TestMessageDropping(t *testing.T) {
 	node2.SetPeers([]string{"node1"})
 
 	// Fill up the message buffer to force drops
-	for range defaultChannelBuffer + 10 {
+	for i := 0; i < defaultChannelBuffer+10; i++ {
 		node1.incomingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
@@ -204,8 +221,8 @@ func TestMessageDropping(t *testing.T) {
 		}
 	}
 
-	node1.state.counter.Store(500)
-	node1.state.version.Store(5)
+	// Set initial state using our helper
+	setNodeState(node1, 500, 5)
 
 	waitForConvergence(t, []*Node{node1, node2}, 500, 5, 2*time.Second)
 
@@ -218,7 +235,7 @@ func TestRingTopology(t *testing.T) {
 	numNodes := 10
 	nodes := make([]*Node, numNodes)
 
-	for i := range numNodes {
+	for i := 0; i < numNodes; i++ {
 		addr := fmt.Sprintf("node%d", i)
 		transport := NewMemoryTransport(addr)
 		config := Config{
@@ -232,7 +249,7 @@ func TestRingTopology(t *testing.T) {
 		nodes[i] = node
 	}
 
-	for i := range numNodes {
+	for i := 0; i < numNodes; i++ {
 		prev := (i - 1 + numNodes) % numNodes
 		next := (i + 1) % numNodes
 		nodes[i].SetPeers([]string{
@@ -241,8 +258,7 @@ func TestRingTopology(t *testing.T) {
 		})
 	}
 
-	nodes[0].state.counter.Store(42)
-	nodes[0].state.version.Store(1)
+	setNodeState(nodes[0], 42, 1)
 
 	waitForConvergence(t, nodes, 42, 1, 3*time.Second)
 
