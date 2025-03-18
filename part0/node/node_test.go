@@ -210,7 +210,7 @@ func TestMessageDropping(t *testing.T) {
 	node2.SetPeers([]string{"node1"})
 
 	// Fill up the message buffer to force drops
-	for i := 0; i < defaultChannelBuffer+10; i++ {
+	for range defaultChannelBuffer + 10 {
 		node1.incomingMsg <- MessageInfo{
 			message: protocol.Message{
 				Type:    protocol.MessageTypePush,
@@ -235,7 +235,7 @@ func TestRingTopology(t *testing.T) {
 	numNodes := 10
 	nodes := make([]*Node, numNodes)
 
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		addr := fmt.Sprintf("node%d", i)
 		transport := NewMemoryTransport(addr)
 		config := Config{
@@ -249,7 +249,7 @@ func TestRingTopology(t *testing.T) {
 		nodes[i] = node
 	}
 
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		prev := (i - 1 + numNodes) % numNodes
 		next := (i + 1) % numNodes
 		nodes[i].SetPeers([]string{
