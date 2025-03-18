@@ -390,6 +390,12 @@ func (n *Node) Decrement() {
 
 	oldState, newState := n.state.Decrement()
 
+	// Check if the state actually changed (no-op check)
+	if oldState.Counter == newState.Counter && oldState.Version == newState.Version {
+		log.Printf("[Node %s] Decrement no-op: counter already at zero", n.config.Addr)
+		return // No need to broadcast since state didn't change
+	}
+
 	log.Printf("[Node %s] Decremented counter from %d to %d, version from %d to %d",
 		n.config.Addr, oldState.Counter, newState.Counter, oldState.Version, newState.Version)
 
