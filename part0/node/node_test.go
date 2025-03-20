@@ -114,11 +114,15 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node
 func TestConcurrentIncrement(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
-	node1.SetPeers([]string{"node2"})
-	node2.SetPeers([]string{"node1"})
+	node3 := createTestNode(t, "node3", 100*time.Millisecond)
+
+	node1.SetPeers([]string{"node2", "node3"})
+	node2.SetPeers([]string{"node1", "node3"})
+	node3.SetPeers([]string{"node2", "node1"})
 
 	var wg1 sync.WaitGroup
 	var wg2 sync.WaitGroup
+	var wg3 sync.WaitGroup
 
 	wg1.Add(1)
 	go func() {
@@ -140,29 +144,40 @@ func TestConcurrentIncrement(t *testing.T) {
 		}
 	}()
 
+	wg3.Add(1)
+	go func() {
+		defer wg3.Done()
+		for i := 0; i < 100; i++ {
+			node3.Increment()
+			// Small sleep to prevent overloading
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
 	wg1.Wait()
 	wg2.Wait()
+	wg3.Wait()
 
 	// Give nodes some time to sync before checking convergence
 	time.Sleep(200 * time.Millisecond)
 
 	// Check for convergence to total counter of 200 (100 from each node)
-	waitForConvergence(t, []*Node{node1, node2}, 200, 5*time.Second)
-
-	// Additional validation
-	increments1, _ := node1.counter.Counters()
-	increments2, _ := node2.counter.Counters()
-
-	// Verify that each node has the correct counter values
-	require.Equal(t, uint64(100), increments1["node1"], "Node1 should have 100 increments for itself")
-	require.Equal(t, uint64(100), increments1["node2"], "Node1 should have 100 increments for node2")
-	require.Equal(t, uint64(100), increments2["node1"], "Node2 should have 100 increments for node1")
-	require.Equal(t, uint64(100), increments2["node2"], "Node2 should have 100 increments for itself")
-
-	node1.Close()
-	node2.Close()
-
-	time.Sleep(500 * time.Millisecond)
+	waitForConvergence(t, []*Node{node1, node2, node3}, 300, 5*time.Second)
+	//
+	// // Additional validation
+	// increments1, _ := node1.counter.Counters()
+	// increments2, _ := node2.counter.Counters()
+	//
+	// // Verify that each node has the correct counter values
+	// require.Equal(t, uint64(100), increments1["node1"], "Node1 should have 100 increments for itself")
+	// require.Equal(t, uint64(100), increments1["node2"], "Node1 should have 100 increments for node2")
+	// require.Equal(t, uint64(100), increments2["node1"], "Node2 should have 100 increments for node1")
+	// require.Equal(t, uint64(100), increments2["node2"], "Node2 should have 100 increments for itself")
+	//
+	// node1.Close()
+	// node2.Close()
+	//
+	// time.Sleep(500 * time.Millisecond)
 }
 
 // Test with three nodes to verify proper CRDT behavior

@@ -3,8 +3,9 @@ package node
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand/v2"
+	"os"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ type MessageInfo struct {
 type Node struct {
 	config  Config
 	counter *crdt.PNCounter // Using PNCounter CRDT instead of GCounter
+	logger  *slog.Logger
 
 	peers   []string
 	peersMu sync.RWMutex
@@ -70,9 +72,14 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})).With("[NODE]", config.Addr)
+
 	node := &Node{
 		config:    config,
 		counter:   crdt.NewPNCounter(config.Addr), // Initialize PNCounter CRDT
+		logger:    logger,
 		peers:     make([]string, 0),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -103,17 +110,17 @@ func (n *Node) startTransport() error {
 
 		msg, err := protocol.DecodeMessage(data)
 		if err != nil {
-			return fmt.Errorf("[Node %s]: StartTransport failed to read %w", n.config.Addr, err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 		select {
 		case n.incomingMsg <- MessageInfo{message: *msg, addr: addr}:
 		default:
-			log.Printf("[Node %s]: Dropping message. Channel is full", addr)
+			n.logger.Warn("dropping message, channel is full", "from", addr)
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("[Node %s]: Failed to start transport listener: %w", n.config.Addr, err)
+		return fmt.Errorf("failed to start transport listener: %w", err)
 	}
 
 	return nil
@@ -123,7 +130,7 @@ func (n *Node) eventLoop() {
 	for {
 		select {
 		case <-n.ctx.Done():
-			log.Printf("[Node %s] Shutting down with counter=%d", n.config.Addr, n.counter.Value())
+			n.logger.Info("shutting down", "counter", n.counter.Value())
 			return
 
 		case msg := <-n.incomingMsg:
@@ -134,8 +141,9 @@ func (n *Node) eventLoop() {
 			data := msg.message.Encode()
 
 			if err := n.transport.Send(msg.addr, data); err != nil {
-				log.Printf("[Node %s] Failed to send message to %s: %v",
-					n.config.Addr, msg.addr, err)
+				n.logger.Error("failed to send message",
+					"to", msg.addr,
+					"error", err)
 			}
 
 		case <-n.syncTick:
@@ -157,50 +165,13 @@ func (n *Node) prepareCounterMessage(msgType uint8) protocol.Message {
 	}
 }
 
-func (n *Node) broadcastUpdate() {
-	ctx, cancel := context.WithTimeout(n.ctx, n.config.SyncInterval/2)
-	defer cancel()
-
-	g, ctx := errgroup.WithContext(ctx)
-	n.peersMu.RLock()
-	peers := n.peers
-	n.peersMu.RUnlock()
-
-	message := n.prepareCounterMessage(protocol.MessageTypePush)
-
-	for _, peerAddr := range peers {
-		peerAddr := peerAddr // Shadow the variable for goroutine
-		g.Go(func() error {
-			// Get both increment and decrement counters for logging
-			increments, decrements := n.counter.Counters()
-
-			log.Printf("[Node %s] Sent message to %s type=%d, counter=%d, inc=%v, dec=%v",
-				n.config.Addr, peerAddr, message.Type, n.counter.Value(), increments, decrements)
-
-			select {
-			case n.outgoingMsg <- MessageInfo{
-				message: message,
-				addr:    peerAddr,
-			}:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
-	}
-}
-
 func (n *Node) pullState() {
 	n.peersMu.RLock()
 	peers := n.peers
 	n.peersMu.RUnlock()
 
 	if len(peers) == 0 {
-		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
+		n.logger.Info("no peers available for sync")
 		return
 	}
 
@@ -226,8 +197,12 @@ func (n *Node) pullState() {
 			// Get both increment and decrement counters for logging
 			increments, decrements := n.counter.Counters()
 
-			log.Printf("[Node %s] Sent message to %s type=%d, counter=%d, inc=%v, dec=%v",
-				n.config.Addr, peerAddr, message.Type, n.counter.Value(), increments, decrements)
+			n.logger.Info("pulling state",
+				"from", peerAddr,
+				"type", message.Type,
+				"counter", n.counter.Value(),
+				"increments", fmt.Sprintf("%v", increments),
+				"decrements", fmt.Sprintf("%v", decrements))
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
@@ -242,7 +217,7 @@ func (n *Node) pullState() {
 	}
 
 	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+		n.logger.Error("sync round failed", "error", err)
 	}
 }
 
@@ -251,9 +226,12 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		inc.message.Type == protocol.MessageTypePush,
 		"invalid message type")
 
-	log.Printf("[Node %s] Received message from %s type=%d, nodeID=%s, inc=%v, dec=%v",
-		n.config.Addr, inc.addr, inc.message.Type, inc.message.NodeID,
-		inc.message.IncrementValues, inc.message.DecrementValues)
+	n.logger.Info("received message",
+		"from", inc.addr,
+		"type", inc.message.Type,
+		"nodeID", inc.message.NodeID,
+		"increments", fmt.Sprintf("%v", inc.message.IncrementValues),
+		"decrements", fmt.Sprintf("%v", inc.message.DecrementValues))
 
 	// Create a PNCounter from received values
 	tempCounter := crdt.NewPNCounter(inc.message.NodeID)
@@ -268,9 +246,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		// Get both increment and decrement counters for logging
 		increments, decrements := n.counter.Counters()
 
-		log.Printf("[Node %s] Counter updated after merge: total=%d, inc=%v, dec=%v",
-			n.config.Addr, n.counter.Value(), increments, decrements)
-		n.broadcastUpdate()
+		n.logger.Info("counter updated after merge",
+			"total", n.counter.Value(),
+			"increments", fmt.Sprintf("%v", increments),
+			"decrements", fmt.Sprintf("%v", decrements))
 	}
 
 	// If it's a pull request, always respond with our current state
@@ -280,8 +259,12 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		// Get both increment and decrement counters for logging
 		increments, decrements := n.counter.Counters()
 
-		log.Printf("[Node %s] Sent message to %s type=%d, counter=%d, inc=%v, dec=%v",
-			n.config.Addr, inc.addr, responseMsg.Type, n.counter.Value(), increments, decrements)
+		n.logger.Info("responding to pull",
+			"to", inc.addr,
+			"type", responseMsg.Type,
+			"counter", n.counter.Value(),
+			"increments", fmt.Sprintf("%v", increments),
+			"decrements", fmt.Sprintf("%v", decrements))
 
 		n.outgoingMsg <- MessageInfo{
 			message: responseMsg,
@@ -299,10 +282,11 @@ func (n *Node) Increment() {
 	// Get both increment and decrement counters for logging
 	increments, decrements := n.counter.Counters()
 
-	log.Printf("[Node %s] Incremented counter from %d to %d, inc=%v, dec=%v",
-		n.config.Addr, oldValue, newValue, increments, decrements)
-
-	n.broadcastUpdate()
+	n.logger.Info("incremented counter",
+		"from", oldValue,
+		"to", newValue,
+		"increments", fmt.Sprintf("%v", increments),
+		"decrements", fmt.Sprintf("%v", decrements))
 }
 
 func (n *Node) Decrement() {
@@ -314,10 +298,11 @@ func (n *Node) Decrement() {
 	// Get both increment and decrement counters for logging
 	increments, decrements := n.counter.Counters()
 
-	log.Printf("[Node %s] Decremented counter from %d to %d, inc=%v, dec=%v",
-		n.config.Addr, oldValue, newValue, increments, decrements)
-
-	n.broadcastUpdate()
+	n.logger.Info("decremented counter",
+		"from", oldValue,
+		"to", newValue,
+		"increments", fmt.Sprintf("%v", increments),
+		"decrements", fmt.Sprintf("%v", decrements))
 }
 
 func (n *Node) GetCounter() int64 {
