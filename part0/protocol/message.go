@@ -1,5 +1,6 @@
 package protocol
 
+// TODO: xxHash or murmur3 for digestion based hashing
 import (
 	"errors"
 	"fmt"
@@ -13,9 +14,11 @@ import (
 const (
 	MessageTypePull       = 0x01
 	MessageTypePush       = 0x02
+	MessageTypeDigestPull = 0x03 // Request with just a digest
+	MessageTypeDigestAck  = 0x04 // Acknowledgment when digests match
 	MessageFlagCompressed = 0x80
 
-	CompressionThreshold = 100 // Only compress message larger than this (Bytes)
+	CompressionThreshold = 512 // Only compress message larger than this (Bytes)
 	DefaultBufferSize    = 4096
 	MaxMessageSize       = 10 * 1024 * 1024 // 10MB max message size
 )
@@ -36,6 +39,7 @@ type Message struct {
 	NodeID          string     `msgpack:"id"`
 	IncrementValues crdt.PNMap `msgpack:"inc"`
 	DecrementValues crdt.PNMap `msgpack:"dec"`
+	Digest          uint64     `msgpack:"dig,omitempty"` // xxHash digest of state
 }
 
 // Validate checks if the message is valid
