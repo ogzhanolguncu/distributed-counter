@@ -1,13 +1,12 @@
 package crdt
 
 import (
-	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const maxRetryCount = 10
+const maxRetryCount = 50
 
 type (
 	PNMap map[string]uint64
@@ -37,11 +36,11 @@ type (
 func New(nodeId string) *PNCounter {
 	c := &PNCounter{
 		incrementMapPool: sync.Pool{New: func() any {
-			m := make(map[string]uint64)
+			m := make(PNMap)
 			return &m
 		}},
 		decrementMapPool: sync.Pool{New: func() any {
-			m := make(map[string]uint64)
+			m := make(PNMap)
 			return &m
 		}},
 	}
@@ -93,25 +92,6 @@ func (p *PNCounter) LocalValue(nodeId string) int64 {
 // Increments atomically increments the counter for the specified node
 // The pattern creates a new map copy rather than modifying the existing one to prevent data corruption
 // if the atomic swap fails, ensuring consistent state across concurrent operations.
-// func (p *PNCounter) Increment(nodeId string) int64 {
-// 	for {
-// 		currentIncrements := p.increments.Load()
-//
-// 		// Create a new map with increment applied
-// 		newIncrements := maps.Clone(*currentIncrements)
-// 		newIncrements[nodeId]++
-//
-// 		// Try to swap
-// 		if p.increments.CompareAndSwap(currentIncrements, &newIncrements) {
-// 			return p.Value()
-// 		}
-// 		// Try until it's successfull
-// 	}
-// }
-
-// Increments atomically increments the counter for the specified node
-// The pattern creates a new map copy rather than modifying the existing one to prevent data corruption
-// if the atomic swap fails, ensuring consistent state across concurrent operations.
 func (p *PNCounter) Increment(nodeId string) int64 {
 	retry := &Retry[int64]{
 		MaxAttempts: maxRetryCount,
@@ -127,8 +107,6 @@ func (p *PNCounter) Increment(nodeId string) int64 {
 
 		// Try to swap
 		if p.increments.CompareAndSwap(currentIncrements, newIncrementsPtr) {
-			// Put the old map back in the pool
-			p.incrementMapPool.Put(currentIncrements)
 			return RetryResult[int64]{Value: p.Value(), Done: true}
 		}
 
@@ -155,8 +133,6 @@ func (p *PNCounter) Decrement(nodeId string) int64 {
 
 		// Try to swap
 		if p.decrements.CompareAndSwap(currentDecrements, newDecrementsPtr) {
-			// Put the old map back in the pool
-			p.decrementMapPool.Put(currentDecrements)
 			return RetryResult[int64]{Value: p.Value(), Done: true}
 		}
 
@@ -192,23 +168,19 @@ func (p *PNCounter) MergeIncrements(other PNMap) bool {
 		// Merge by taking max value for each node
 		for nodeID, otherValue := range other {
 			currentValue, exists := newIncrements[nodeID]
-			if !exists || otherValue > currentValue {
+			if (!exists && otherValue > 0) || otherValue > currentValue {
 				newIncrements[nodeID] = otherValue
 				updated = true
 			}
 		}
 
 		if !updated {
-			// If unsuccessful, put the unused map back in the pool
 			p.incrementMapPool.Put(newIncrementsPtr)
-			//  Return old Value if swap is unsuccessful
 			return RetryResult[bool]{Value: false, Done: true}
 		}
 
 		// Try to swap
 		if p.increments.CompareAndSwap(currentIncrements, newIncrementsPtr) {
-			// Put the old map back in the pool
-			p.incrementMapPool.Put(currentIncrements)
 			return RetryResult[bool]{Value: true, Done: true}
 		}
 
@@ -234,23 +206,19 @@ func (p *PNCounter) MergeDecrements(other PNMap) bool {
 		// Merge by taking max value for each node
 		for nodeID, otherValue := range other {
 			currentValue, exists := newDecrements[nodeID]
-			if !exists || otherValue > currentValue {
+			if (!exists && otherValue > 0) || otherValue > currentValue {
 				newDecrements[nodeID] = otherValue
 				updated = true
 			}
 		}
 
 		if !updated {
-			// If unsuccessful, put the unused map back in the pool
 			p.decrementMapPool.Put(newDecrementsPtr)
-			//  Return old Value if swap is unsuccessful
 			return RetryResult[bool]{Value: false, Done: true}
 		}
 
 		// Try to swap
 		if p.decrements.CompareAndSwap(currentDecrements, newDecrementsPtr) {
-			// Put the old map back in the pool
-			p.decrementMapPool.Put(currentDecrements)
 			return RetryResult[bool]{Value: true, Done: true}
 		}
 
@@ -272,7 +240,12 @@ func (p *PNCounter) prepareMap(current *atomic.Pointer[PNMap], pool *sync.Pool) 
 	for k := range newMap {
 		delete(newMap, k)
 	}
-	maps.Copy(newMap, *currentMap)
+
+	currentSnapshot := *currentMap
+	for k, v := range currentSnapshot {
+		newMap[k] = v
+	}
+
 	return currentMap, newMapPtr, newMap
 }
 
