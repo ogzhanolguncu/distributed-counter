@@ -3,121 +3,24 @@ package node
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand/v2"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ogzhanolguncu/distributed-counter/part0/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part0/crdt"
 	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
 	"golang.org/x/sync/errgroup"
 )
 
-const defaultChannelBuffer = 100
+const defaultChannelBuffer = 10000
 
 type Config struct {
 	Addr         string
 	SyncInterval time.Duration
 	MaxSyncPeers int
-}
-
-// CounterVersionState holds counter and version in a single 16-byte struct
-// that can be atomically updated
-type CounterVersionState struct {
-	Counter uint64
-	Version uint64
-}
-
-type State struct {
-	// Use atomic.Pointer to allow atomic updates of the entire structure
-	state atomic.Pointer[CounterVersionState]
-}
-
-func NewState() *State {
-	s := &State{}
-	initialState := &CounterVersionState{
-		Counter: 0,
-		Version: 0,
-	}
-	s.state.Store(initialState)
-	return s
-}
-
-// GetState returns the current state atomically
-func (s *State) GetState() *CounterVersionState {
-	return s.state.Load()
-}
-
-// Increment atomically increments the counter and version
-func (s *State) Increment() (*CounterVersionState, *CounterVersionState) {
-	for {
-		// Load current state
-		current := s.state.Load()
-
-		// Create new state
-		next := &CounterVersionState{
-			Counter: current.Counter + 1,
-			Version: current.Version + 1,
-		}
-
-		// Try to swap - if successful, return old and new states
-		if s.state.CompareAndSwap(current, next) {
-			return current, next
-		}
-		// If unsuccessful, someone else updated it, try again
-	}
-}
-
-// Decrement atomically decrements the counter and increments the version
-// If counter is already 0, this is a no-op and returns the current state twice
-func (s *State) Decrement() (*CounterVersionState, *CounterVersionState) {
-	for {
-		// Load current state
-		current := s.state.Load()
-
-		// Check if counter is already 0
-		if current.Counter == 0 {
-			// Return the same state twice to indicate no change
-			return current, current
-		}
-
-		// Create new state
-		next := &CounterVersionState{
-			Counter: current.Counter - 1,
-			Version: current.Version + 1,
-		}
-
-		// Try to swap - if successful, return old and new states
-		if s.state.CompareAndSwap(current, next) {
-			return current, next
-		}
-		// If unsuccessful, someone else updated it, try again
-	}
-}
-
-// UpdateIfNewer atomically updates state only if the new version is newer
-func (s *State) UpdateIfNewer(newCounter uint64, newVersion uint64) bool {
-	for {
-		current := s.state.Load()
-
-		// Check if we need to update
-		if current.Version >= newVersion {
-			return false // No update needed
-		}
-
-		// Create new state with updated values
-		next := &CounterVersionState{
-			Counter: newCounter,
-			Version: newVersion,
-		}
-
-		// Try atomic update
-		if s.state.CompareAndSwap(current, next) {
-			return true
-		}
-		// If update failed, loop and try again
-	}
 }
 
 type MessageInfo struct {
@@ -126,8 +29,9 @@ type MessageInfo struct {
 }
 
 type Node struct {
-	config Config
-	state  *State
+	config  Config
+	counter *crdt.PNCounter
+	logger  *slog.Logger
 
 	peers   []string
 	peersMu sync.RWMutex
@@ -168,9 +72,14 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})).With("[NODE]", config.Addr)
+
 	node := &Node{
 		config:    config,
-		state:     NewState(),
+		counter:   crdt.New(config.Addr),
+		logger:    logger,
 		peers:     make([]string, 0),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -181,7 +90,7 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 		syncTick:    time.NewTicker(config.SyncInterval).C,
 	}
 
-	assertions.AssertNotNil(node.state, "node state must be initialized")
+	assertions.AssertNotNil(node.counter, "node counter must be initialized")
 	assertions.AssertNotNil(node.ctx, "node context must be initialized")
 	assertions.AssertNotNil(node.cancel, "node cancel function must be initialized")
 
@@ -199,19 +108,19 @@ func (n *Node) startTransport() error {
 		assertions.Assert(addr != "", "incoming addr cannot be empty")
 		assertions.AssertNotNil(data, "incoming data cannot be nil or empty")
 
-		msg, err := protocol.DecodeMessage(data)
+		msg, err := protocol.Decode(data)
 		if err != nil {
-			return fmt.Errorf("[Node %s]: StartTransport failed to read %w", n.config.Addr, err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 		select {
 		case n.incomingMsg <- MessageInfo{message: *msg, addr: addr}:
 		default:
-			log.Printf("[Node %s]: Dropping message. Channel is full", addr)
+			n.logger.Warn("dropping message, channel is full", "from", addr)
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("[Node %s]: Failed to start transport listener: %w", n.config.Addr, err)
+		return fmt.Errorf("failed to start transport listener: %w", err)
 	}
 
 	return nil
@@ -221,9 +130,7 @@ func (n *Node) eventLoop() {
 	for {
 		select {
 		case <-n.ctx.Done():
-			currentState := n.state.GetState()
-			log.Printf("[Node %s] Shutting down with version=%d and counter=%d",
-				n.config.Addr, currentState.Version, currentState.Counter)
+			n.logger.Info("shutting down", "counter", n.counter.Value())
 			return
 
 		case msg := <-n.incomingMsg:
@@ -231,11 +138,18 @@ func (n *Node) eventLoop() {
 
 		case msg := <-n.outgoingMsg:
 			assertions.Assert(msg.addr != "", "outgoing addr cannot be empty")
-			assertions.AssertEqual(protocol.MessageSize, len(msg.message.Encode()), fmt.Sprintf("formatted message cannot be smaller than %d", protocol.MessageSize))
+			data, err := protocol.Encode(msg.message)
+			if err != nil {
+				n.logger.Error("failed to encode message",
+					"to", msg.addr,
+					"error", err)
+				continue
+			}
 
-			if err := n.transport.Send(msg.addr, msg.message.Encode()); err != nil {
-				log.Printf("[Node %s] Failed to send message to %s: %v",
-					n.config.Addr, msg.addr, err)
+			if err := n.transport.Send(msg.addr, data); err != nil {
+				n.logger.Error("failed to send message",
+					"to", msg.addr,
+					"error", err)
 			}
 
 		case <-n.syncTick:
@@ -244,53 +158,26 @@ func (n *Node) eventLoop() {
 	}
 }
 
-func (n *Node) broadcastUpdate() {
-	ctx, cancel := context.WithTimeout(n.ctx, n.config.SyncInterval/2)
-	defer cancel()
+// Create a message with the current counter state
+func (n *Node) prepareCounterMessage(msgType uint8) protocol.Message {
+	// Get both increment and decrement counters
+	increments, decrements := n.counter.Counters()
 
-	g, ctx := errgroup.WithContext(ctx)
-	n.peersMu.RLock()
-	peers := n.peers
-	n.peersMu.RUnlock()
-
-	currentState := n.state.GetState()
-
-	for _, peerAddr := range peers {
-		peerAddr := peerAddr // Shadow the variable for goroutine
-		g.Go(func() error {
-			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePush, currentState.Version, currentState.Counter)
-
-			select {
-			case n.outgoingMsg <- MessageInfo{
-				message: protocol.Message{
-					Type:    protocol.MessageTypePush,
-					Version: currentState.Version,
-					Counter: currentState.Counter,
-				},
-				addr: peerAddr,
-			}:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+	return protocol.Message{
+		Type:            msgType,
+		NodeID:          n.config.Addr,
+		IncrementValues: increments,
+		DecrementValues: decrements,
 	}
 }
 
-// We periodically pull other node's states. This is also called "Anti-entropy".
-// This is really good to prevent data loss and to make late joining nodes converge faster
 func (n *Node) pullState() {
 	n.peersMu.RLock()
 	peers := n.peers
 	n.peersMu.RUnlock()
 
 	if len(peers) == 0 {
-		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
+		n.logger.Info("no peers available for sync")
 		return
 	}
 
@@ -308,22 +195,25 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	currentState := n.state.GetState()
+	message := n.prepareCounterMessage(protocol.MessageTypePull)
 
 	for _, peer := range selectedPeers[:numPeers] {
 		peerAddr := peer // Shadow the variable for goroutine
 		g.Go(func() error {
-			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePull, currentState.Version, currentState.Counter)
+			// Get both increment and decrement counters for logging
+			increments, decrements := n.counter.Counters()
+
+			n.logger.Info("pulling state",
+				"from", peerAddr,
+				"type", message.Type,
+				"counter", n.counter.Value(),
+				"increments", fmt.Sprintf("%v", increments),
+				"decrements", fmt.Sprintf("%v", decrements))
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
-				message: protocol.Message{
-					Type:    protocol.MessageTypePull,
-					Version: currentState.Version,
-					Counter: currentState.Counter,
-				},
-				addr: peerAddr,
+				message: message,
+				addr:    peerAddr,
 			}:
 				return nil
 			case <-ctx.Done():
@@ -333,7 +223,7 @@ func (n *Node) pullState() {
 	}
 
 	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+		n.logger.Error("sync round failed", "error", err)
 	}
 }
 
@@ -342,74 +232,89 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		inc.message.Type == protocol.MessageTypePush,
 		"invalid message type")
 
-	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
-		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
+	n.logger.Info("received message",
+		"from", inc.addr,
+		"type", inc.message.Type,
+		"nodeID", inc.message.NodeID,
+		"increments", fmt.Sprintf("%v", inc.message.IncrementValues),
+		"decrements", fmt.Sprintf("%v", inc.message.DecrementValues))
 
-	updated := false
+	// Create a PNCounter from received values
+	tempCounter := crdt.New(inc.message.NodeID)
+	tempCounter.MergeIncrements(inc.message.IncrementValues)
+	tempCounter.MergeDecrements(inc.message.DecrementValues)
 
-	// Try to update our state if the incoming message has a newer version
-	if inc.message.Version > n.state.GetState().Version {
-		updated = n.state.UpdateIfNewer(inc.message.Counter, inc.message.Version)
+	// Merge with our local counter
+	updated := n.counter.Merge(tempCounter)
 
-		if updated {
-			// If we updated our state, broadcast to other peers
-			n.broadcastUpdate()
-		}
+	if updated {
+		increments, decrements := n.counter.Counters()
+
+		n.logger.Info("counter updated after merge",
+			"total", n.counter.Value(),
+			"increments", fmt.Sprintf("%v", increments),
+			"decrements", fmt.Sprintf("%v", decrements))
 	}
 
 	// If it's a pull request, always respond with our current state
 	if inc.message.Type == protocol.MessageTypePull {
-		currentState := n.state.GetState()
-		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-			n.config.Addr, inc.addr, protocol.MessageTypePush, currentState.Version, currentState.Counter)
+		responseMsg := n.prepareCounterMessage(protocol.MessageTypePush)
+
+		// Get both increment and decrement counters for logging
+		increments, decrements := n.counter.Counters()
+
+		n.logger.Info("responding to pull",
+			"to", inc.addr,
+			"type", responseMsg.Type,
+			"counter", n.counter.Value(),
+			"increments", fmt.Sprintf("%v", increments),
+			"decrements", fmt.Sprintf("%v", decrements))
 
 		n.outgoingMsg <- MessageInfo{
-			message: protocol.Message{
-				Type:    protocol.MessageTypePush,
-				Version: currentState.Version,
-				Counter: currentState.Counter,
-			},
-			addr: inc.addr,
+			message: responseMsg,
+			addr:    inc.addr,
 		}
 	}
 }
 
 func (n *Node) Increment() {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
-	oldState, newState := n.state.Increment()
+	oldValue := n.counter.Value()
+	newValue := n.counter.Increment(n.config.Addr)
 
-	log.Printf("[Node %s] Incremented counter from %d to %d, version from %d to %d",
-		n.config.Addr, oldState.Counter, newState.Counter, oldState.Version, newState.Version)
+	increments, decrements := n.counter.Counters()
 
-	n.broadcastUpdate()
+	n.logger.Info("incremented counter",
+		"from", oldValue,
+		"to", newValue,
+		"increments", fmt.Sprintf("%v", increments),
+		"decrements", fmt.Sprintf("%v", decrements))
 }
 
 func (n *Node) Decrement() {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
-	oldState, newState := n.state.Decrement()
+	oldValue := n.counter.Value()
+	newValue := n.counter.Decrement(n.config.Addr)
 
-	// Check if the state actually changed (no-op check)
-	if oldState.Counter == newState.Counter && oldState.Version == newState.Version {
-		log.Printf("[Node %s] Decrement no-op: counter already at zero", n.config.Addr)
-		return // No need to broadcast since state didn't change
-	}
+	increments, decrements := n.counter.Counters()
 
-	log.Printf("[Node %s] Decremented counter from %d to %d, version from %d to %d",
-		n.config.Addr, oldState.Counter, newState.Counter, oldState.Version, newState.Version)
-
-	n.broadcastUpdate()
+	n.logger.Info("decremented counter",
+		"from", oldValue,
+		"to", newValue,
+		"increments", fmt.Sprintf("%v", increments),
+		"decrements", fmt.Sprintf("%v", decrements))
 }
 
-func (n *Node) GetCounter() uint64 {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.GetState().Counter
+func (n *Node) GetCounter() int64 {
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
+	return n.counter.Value()
 }
 
-func (n *Node) GetVersion() uint64 {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.GetState().Version
+func (n *Node) GetLocalCounter() int64 {
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
+	return n.counter.LocalValue(n.config.Addr)
 }
 
 func (n *Node) GetAddr() string {
