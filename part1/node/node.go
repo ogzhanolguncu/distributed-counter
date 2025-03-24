@@ -248,8 +248,7 @@ func (n *Node) pullState() {
 
 func (n *Node) handleIncMsg(inc MessageInfo) {
 	assertions.Assert(
-		inc.message.Type == protocol.MessageTypePull ||
-			inc.message.Type == protocol.MessageTypePush ||
+		inc.message.Type == protocol.MessageTypePush ||
 			inc.message.Type == protocol.MessageTypeDigestAck ||
 			inc.message.Type == protocol.MessageTypeDigestPull,
 		"invalid message type")
@@ -316,26 +315,6 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			"total", n.counter.Value(),
 			"increments", fmt.Sprintf("%v", increments),
 			"decrements", fmt.Sprintf("%v", decrements))
-	}
-
-	// If it's a pull request, always respond with our current state
-	if inc.message.Type == protocol.MessageTypePull {
-		responseMsg := n.prepareCounterMessage(protocol.MessageTypePush)
-
-		// Get both increment and decrement counters for logging
-		increments, decrements := n.counter.Counters()
-
-		n.logger.Info("responding to pull",
-			"to", inc.addr,
-			"type", responseMsg.Type,
-			"counter", n.counter.Value(),
-			"increments", fmt.Sprintf("%v", increments),
-			"decrements", fmt.Sprintf("%v", decrements))
-
-		n.outgoingMsg <- MessageInfo{
-			message: responseMsg,
-			addr:    inc.addr,
-		}
 	}
 }
 

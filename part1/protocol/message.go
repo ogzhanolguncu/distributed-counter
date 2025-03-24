@@ -11,10 +11,9 @@ import (
 )
 
 const (
-	MessageTypePull       = 0x01
-	MessageTypePush       = 0x02
-	MessageTypeDigestPull = 0x03 // Request with just a digest
-	MessageTypeDigestAck  = 0x04 // Acknowledgment when digests match
+	MessageTypePush       = 0x01
+	MessageTypeDigestPull = 0x02 // Request with just a digest
+	MessageTypeDigestAck  = 0x03 // Acknowledgment when digests match
 	MessageFlagCompressed = 0x80
 
 	CompressionThreshold = 1024 // Only compress message larger than this (Bytes)
@@ -45,7 +44,7 @@ type Message struct {
 func (m *Message) validate() error {
 	assertions.Assert(m != nil, "Message cannot be nil")
 	// Check message type is valid
-	if m.Type != MessageTypePull && m.Type != MessageTypePush && m.Type != MessageTypeDigestAck && m.Type != MessageTypeDigestPull {
+	if m.Type != MessageTypePush && m.Type != MessageTypeDigestAck && m.Type != MessageTypeDigestPull {
 		return ErrInvalidType
 	}
 
@@ -147,7 +146,7 @@ func Encode(msg Message) ([]byte, error) {
 	assertions.Assert(msg.NodeID != "", "Node ID cannot be empty")
 
 	// Validate message type
-	assertions.Assert(msg.Type == MessageTypePull || msg.Type == MessageTypePush || msg.Type == MessageTypeDigestAck || msg.Type == MessageTypeDigestPull,
+	assertions.Assert(msg.Type == MessageTypePush || msg.Type == MessageTypeDigestAck || msg.Type == MessageTypeDigestPull,
 		"Message type must be either MessageTypePull or MessageTypePush")
 
 	// For push messages, require values
