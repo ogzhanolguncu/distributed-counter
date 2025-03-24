@@ -1,7 +1,7 @@
 package crdt
 
 import (
-	"sync"
+	"maps"
 	"sync/atomic"
 	"time"
 )
@@ -11,87 +11,90 @@ const maxRetryCount = 50
 type (
 	PNMap map[string]uint64
 
+	// RefCountedMap wraps a PNMap with reference counting for Copy-on-Write operations
+	RefCountedMap struct {
+		data     PNMap
+		refCount int32 // Using atomic operations for thread-safe reference counting
+	}
+
 	// PNCounter (Positive-Negative Counter) is a conflict-free replicated data type (CRDT)
 	// that allows both incrementing and decrementing a counter in a distributed system.
-	// Key CRDT properties:
-	// - Convergence: All replicas will eventually reach the same state when they have
-	//   processed the same updates, regardless of the order in which updates are received.
-	// - Commutativity: The order of merge operations doesn't affect the final state.
-	// - Associativity: Merging multiple counters can be done in any grouping order.
-	//
-	// Implementation details:
-	// - Uses two G-Counters (grow-only counters): one for increments and one for decrements
-	// - Each node maintains its own counter values in the respective maps
-	// - The final value is computed as (sum of all increments) - (sum of all decrements)
-	// - Concurrent operations are resolved by taking the maximum value for each node ID
+	// This version uses Copy-on-Write with Reference Counting for improved performance.
 	PNCounter struct {
-		increments atomic.Pointer[PNMap]
-		decrements atomic.Pointer[PNMap]
-
-		incrementMapPool sync.Pool
-		decrementMapPool sync.Pool
+		increments atomic.Pointer[RefCountedMap]
+		decrements atomic.Pointer[RefCountedMap]
 	}
 )
 
-func New(nodeId string) *PNCounter {
-	c := &PNCounter{
-		incrementMapPool: sync.Pool{New: func() any {
-			m := make(PNMap)
-			return &m
-		}},
-		decrementMapPool: sync.Pool{New: func() any {
-			m := make(PNMap)
-			return &m
-		}},
+// NewRefCountedMap creates a new map with an initial reference count of 1
+func NewRefCountedMap() *RefCountedMap {
+	return &RefCountedMap{
+		data:     make(PNMap),
+		refCount: 1, // Start with 1 reference
 	}
+}
 
-	initialIncrements := make(PNMap)
-	initialIncrements[nodeId] = 0
-	c.increments.Store(&initialIncrements)
+// Acquire increments the reference count
+func (r *RefCountedMap) Acquire() {
+	atomic.AddInt32(&r.refCount, 1)
+}
 
-	initialDecrements := make(PNMap)
-	initialDecrements[nodeId] = 0
-	c.decrements.Store(&initialDecrements)
+// Release decrements the reference count and returns true if the count reached zero
+func (r *RefCountedMap) Release() bool {
+	return atomic.AddInt32(&r.refCount, -1) == 0
+}
+
+// New creates a new PNCounter with the provided node ID
+func New(nodeId string) *PNCounter {
+	c := &PNCounter{}
+
+	// Initialize increment map with node ID
+	incMap := NewRefCountedMap()
+	incMap.data[nodeId] = 0
+	c.increments.Store(incMap)
+
+	// Initialize decrement map with node ID
+	decMap := NewRefCountedMap()
+	decMap.data[nodeId] = 0
+	c.decrements.Store(decMap)
 
 	return c
 }
 
-// Returns the current of value of the counter (increments - decrements)
+// Value returns the current value of the counter (increments - decrements)
 func (p *PNCounter) Value() int64 {
 	increments := p.increments.Load()
 	decrements := p.decrements.Load()
 
 	var incSum, decSum uint64
-	for _, v := range *increments {
+	for _, v := range increments.data {
 		incSum += v
 	}
-	for _, v := range *decrements {
+	for _, v := range decrements.data {
 		decSum += v
 	}
 
 	return int64(incSum) - int64(decSum)
 }
 
-// Returns the net value for a specific node
+// LocalValue returns the net value for a specific node
 func (p *PNCounter) LocalValue(nodeId string) int64 {
 	increments := p.increments.Load()
 	decrements := p.decrements.Load()
 
 	var incSum, decSum uint64
-	if val, ok := (*increments)[nodeId]; ok {
+	if val, ok := increments.data[nodeId]; ok {
 		incSum = val
 	}
 
-	if val, ok := (*decrements)[nodeId]; ok {
+	if val, ok := decrements.data[nodeId]; ok {
 		decSum = val
 	}
 
 	return int64(incSum) - int64(decSum)
 }
 
-// Increments atomically increments the counter for the specified node
-// The pattern creates a new map copy rather than modifying the existing one to prevent data corruption
-// if the atomic swap fails, ensuring consistent state across concurrent operations.
+// Increment atomically increments the counter for the specified node
 func (p *PNCounter) Increment(nodeId string) int64 {
 	retry := &Retry[int64]{
 		MaxAttempts: maxRetryCount,
@@ -99,25 +102,32 @@ func (p *PNCounter) Increment(nodeId string) int64 {
 	}
 
 	return retry.Do(func() RetryResult[int64] {
-		currentIncrements, newIncrementsPtr, newIncrements := p.prepareMap(&p.increments, &p.incrementMapPool)
-		if _, exists := newIncrements[nodeId]; !exists {
-			newIncrements[nodeId] = 0
-		}
-		newIncrements[nodeId]++
+		// Get the current ref-counted map
+		currentMap := p.increments.Load()
 
-		// Try to swap
-		if p.increments.CompareAndSwap(currentIncrements, newIncrementsPtr) {
+		// Create a new map with the same data
+		newMap := NewRefCountedMap()
+		maps.Copy(newMap.data, currentMap.data)
+
+		// Make our increment
+		if _, exists := newMap.data[nodeId]; !exists {
+			newMap.data[nodeId] = 0
+		}
+		newMap.data[nodeId]++
+
+		// Try to swap atomically
+		if p.increments.CompareAndSwap(currentMap, newMap) {
+			// Successfully swapped, release old reference
+			currentMap.Release()
 			return RetryResult[int64]{Value: p.Value(), Done: true}
 		}
 
-		// If unsuccessful, put the unused map back in the pool
-		p.incrementMapPool.Put(newIncrementsPtr)
-		//  Return old Value if swap is unsuccessful
+		// Failed to swap, discard our new map
 		return RetryResult[int64]{Value: p.Value(), Done: false}
 	})
 }
 
-// Decrements atomically decrements the counter for the specified node
+// Decrement atomically decrements the counter for the specified node
 func (p *PNCounter) Decrement(nodeId string) int64 {
 	retry := &Retry[int64]{
 		MaxAttempts: maxRetryCount,
@@ -125,37 +135,47 @@ func (p *PNCounter) Decrement(nodeId string) int64 {
 	}
 
 	return retry.Do(func() RetryResult[int64] {
-		currentDecrements, newDecrementsPtr, newDecrements := p.prepareMap(&p.decrements, &p.decrementMapPool)
-		if _, exists := newDecrements[nodeId]; !exists {
-			newDecrements[nodeId] = 0
-		}
-		newDecrements[nodeId]++
+		// Get the current ref-counted map
+		currentMap := p.decrements.Load()
 
-		// Try to swap
-		if p.decrements.CompareAndSwap(currentDecrements, newDecrementsPtr) {
+		// Create a new map with the same data
+		newMap := NewRefCountedMap()
+		maps.Copy(newMap.data, currentMap.data)
+
+		// Make our decrement
+		if _, exists := newMap.data[nodeId]; !exists {
+			newMap.data[nodeId] = 0
+		}
+		newMap.data[nodeId]++
+
+		// Try to swap atomically
+		if p.decrements.CompareAndSwap(currentMap, newMap) {
+			// Successfully swapped, release old reference
+			currentMap.Release()
 			return RetryResult[int64]{Value: p.Value(), Done: true}
 		}
 
-		// If unsuccessful, put the unused map back in the pool
-		p.decrementMapPool.Put(newDecrementsPtr)
-		//  Return old Value if swap is unsuccessful
+		// Failed to swap, discard our new map
 		return RetryResult[int64]{Value: p.Value(), Done: false}
 	})
 }
 
-// Counters returns copies of the increment and decrement counter maps.
-// The returned maps are independent copies of the internal state,
-// so callers can safely modify them without affecting the CRDT.
-// These maps contain the individual node contributions to the counter.
+// Counters returns copies of the increment and decrement counter maps
 func (p *PNCounter) Counters() (PNMap, PNMap) {
-	increments := *(p.increments.Load())
-	decrements := *(p.decrements.Load())
-	return increments, decrements
+	increments := p.increments.Load().data
+	decrements := p.decrements.Load().data
+
+	// Create independent copies
+	incCopy := make(PNMap, len(increments))
+	decCopy := make(PNMap, len(decrements))
+
+	maps.Copy(incCopy, increments)
+	maps.Copy(decCopy, decrements)
+
+	return incCopy, decCopy
 }
 
-// MergeIncrements merges external increment values with the local counter.
-// This follows the CRDT merge rule of taking the maximum value for each node.
-// Returns true if any values were updated.
+// MergeIncrements merges external increment values with the local counter
 func (p *PNCounter) MergeIncrements(other PNMap) bool {
 	retry := &Retry[bool]{
 		MaxAttempts: maxRetryCount,
@@ -163,37 +183,46 @@ func (p *PNCounter) MergeIncrements(other PNMap) bool {
 	}
 
 	return retry.Do(func() RetryResult[bool] {
-		currentIncrements, newIncrementsPtr, newIncrements := p.prepareMap(&p.increments, &p.incrementMapPool)
+		currentMap := p.increments.Load()
+
+		// Check if there are any updates needed
 		updated := false
-		// Merge by taking max value for each node
 		for nodeID, otherValue := range other {
-			currentValue, exists := newIncrements[nodeID]
+			currentValue, exists := currentMap.data[nodeID]
 			if (!exists && otherValue > 0) || otherValue > currentValue {
-				newIncrements[nodeID] = otherValue
 				updated = true
+				break
 			}
 		}
 
 		if !updated {
-			p.incrementMapPool.Put(newIncrementsPtr)
 			return RetryResult[bool]{Value: false, Done: true}
 		}
 
+		// Create a new map with updates
+		newMap := NewRefCountedMap()
+		maps.Copy(newMap.data, currentMap.data)
+
+		// Merge by taking max value for each node
+		for nodeID, otherValue := range other {
+			currentValue, exists := newMap.data[nodeID]
+			if (!exists && otherValue > 0) || otherValue > currentValue {
+				newMap.data[nodeID] = otherValue
+			}
+		}
+
 		// Try to swap
-		if p.increments.CompareAndSwap(currentIncrements, newIncrementsPtr) {
+		if p.increments.CompareAndSwap(currentMap, newMap) {
+			currentMap.Release()
 			return RetryResult[bool]{Value: true, Done: true}
 		}
 
-		// If unsuccessful, put the unused map back in the pool
-		p.incrementMapPool.Put(newIncrementsPtr)
-		//  Return old Value if swap is unsuccessful
+		// Failed to swap
 		return RetryResult[bool]{Value: false, Done: false}
 	})
 }
 
-// MergeDecrements merges external decrement values with the local counter.
-// This follows the CRDT merge rule of taking the maximum value for each node.
-// Returns true if any values were updated.
+// MergeDecrements merges external decrement values with the local counter
 func (p *PNCounter) MergeDecrements(other PNMap) bool {
 	retry := &Retry[bool]{
 		MaxAttempts: maxRetryCount,
@@ -201,52 +230,43 @@ func (p *PNCounter) MergeDecrements(other PNMap) bool {
 	}
 
 	return retry.Do(func() RetryResult[bool] {
-		currentDecrements, newDecrementsPtr, newDecrements := p.prepareMap(&p.decrements, &p.decrementMapPool)
+		currentMap := p.decrements.Load()
+
+		// Check if there are any updates needed
 		updated := false
-		// Merge by taking max value for each node
 		for nodeID, otherValue := range other {
-			currentValue, exists := newDecrements[nodeID]
+			currentValue, exists := currentMap.data[nodeID]
 			if (!exists && otherValue > 0) || otherValue > currentValue {
-				newDecrements[nodeID] = otherValue
 				updated = true
+				break
 			}
 		}
 
 		if !updated {
-			p.decrementMapPool.Put(newDecrementsPtr)
 			return RetryResult[bool]{Value: false, Done: true}
 		}
 
+		// Create a new map with updates
+		newMap := NewRefCountedMap()
+		maps.Copy(newMap.data, currentMap.data)
+
+		// Merge by taking max value for each node
+		for nodeID, otherValue := range other {
+			currentValue, exists := newMap.data[nodeID]
+			if (!exists && otherValue > 0) || otherValue > currentValue {
+				newMap.data[nodeID] = otherValue
+			}
+		}
+
 		// Try to swap
-		if p.decrements.CompareAndSwap(currentDecrements, newDecrementsPtr) {
+		if p.decrements.CompareAndSwap(currentMap, newMap) {
+			currentMap.Release()
 			return RetryResult[bool]{Value: true, Done: true}
 		}
 
-		// If unsuccessful, put the unused map back in the pool
-		p.decrementMapPool.Put(newDecrementsPtr)
-		//  Return old Value if swap is unsuccessful
+		// Failed to swap
 		return RetryResult[bool]{Value: false, Done: false}
 	})
-}
-
-// prepareMap is a generic helper that prepares a new map from a pool
-// for safe atomic operations on a PNMap
-func (p *PNCounter) prepareMap(current *atomic.Pointer[PNMap], pool *sync.Pool) (*PNMap, *PNMap, PNMap) {
-	currentMap := current.Load()
-	// Get a map from the pool
-	newMapPtr := pool.Get().(*PNMap)
-	newMap := *newMapPtr
-	// Clear the map in case it was used before
-	for k := range newMap {
-		delete(newMap, k)
-	}
-
-	currentSnapshot := *currentMap
-	for k, v := range currentSnapshot {
-		newMap[k] = v
-	}
-
-	return currentMap, newMapPtr, newMap
 }
 
 // Merge combines this counter with another
