@@ -20,9 +20,11 @@ import (
 const defaultChannelBuffer = 10_000
 
 type Config struct {
-	Addr         string
-	SyncInterval time.Duration
-	MaxSyncPeers int
+	Addr             string
+	MaxSyncPeers     int
+	SyncInterval     time.Duration
+	FullSyncInterval time.Duration
+	LogLevel         slog.Level
 }
 
 type MessageInfo struct {
@@ -42,9 +44,10 @@ type Node struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	incomingMsg chan MessageInfo
-	outgoingMsg chan MessageInfo
-	syncTick    <-chan time.Time
+	incomingMsg  chan MessageInfo
+	outgoingMsg  chan MessageInfo
+	syncTick     <-chan time.Time
+	fullSyncTick <-chan time.Time
 }
 
 func (n *Node) SetPeers(peers []string) {
@@ -74,8 +77,12 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 
+	if config.FullSyncInterval == 0 {
+		config.FullSyncInterval = config.SyncInterval * 10 // Default to 10x regular sync interval
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: config.LogLevel,
 	})).With("[NODE]", config.Addr)
 
 	node := &Node{
@@ -87,9 +94,10 @@ func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 		cancel:    cancel,
 		transport: transport,
 
-		incomingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		outgoingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		syncTick:    time.NewTicker(config.SyncInterval).C,
+		incomingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		outgoingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		syncTick:     time.NewTicker(config.SyncInterval).C,
+		fullSyncTick: time.NewTicker(config.FullSyncInterval).C, // Initialize full sync ticker
 	}
 
 	assertions.AssertNotNil(node.counter, "node counter must be initialized")
@@ -155,7 +163,41 @@ func (n *Node) eventLoop() {
 			}
 
 		case <-n.syncTick:
-			n.pullState()
+			n.initiateDigestSync()
+		case <-n.fullSyncTick:
+			n.performFullStateSync()
+		}
+	}
+}
+
+func (n *Node) performFullStateSync() {
+	peers := n.GetPeers()
+	if len(peers) == 0 {
+		n.logger.Info("no peers available for full state sync")
+		return
+	}
+
+	// Select a subset of random peers for full state sync
+	numPeers := max(1, min(n.config.MaxSyncPeers/2, len(peers)))
+	selectedPeers := make([]string, len(peers))
+	copy(selectedPeers, peers)
+	rand.Shuffle(len(selectedPeers), func(i, j int) {
+		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
+	})
+
+	// Prepare full state message
+	message := n.prepareCounterMessage(protocol.MessageTypePush)
+
+	// Log the operation
+	n.logger.Info("performing full state sync (anti-entropy)",
+		"peers_count", numPeers,
+		"counter_value", n.counter.Value())
+
+	// Send to selected peers
+	for _, peer := range selectedPeers[:numPeers] {
+		n.outgoingMsg <- MessageInfo{
+			message: message,
+			addr:    peer,
 		}
 	}
 }
@@ -202,7 +244,7 @@ func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protoc
 	return msg
 }
 
-func (n *Node) pullState() {
+func (n *Node) initiateDigestSync() {
 	n.peersMu.RLock()
 	peers := n.peers
 	n.peersMu.RUnlock()

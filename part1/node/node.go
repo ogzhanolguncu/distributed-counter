@@ -21,10 +21,11 @@ import (
 const defaultChannelBuffer = 10_000
 
 type Config struct {
-	Addr         string
-	SyncInterval time.Duration
-	MaxSyncPeers int
-	LogLevel     slog.Level
+	Addr             string
+	SyncInterval     time.Duration
+	FullSyncInterval time.Duration
+	MaxSyncPeers     int
+	LogLevel         slog.Level
 }
 
 type State struct {
@@ -48,9 +49,10 @@ type Node struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	incomingMsg chan MessageInfo
-	outgoingMsg chan MessageInfo
-	syncTick    <-chan time.Time
+	incomingMsg  chan MessageInfo
+	outgoingMsg  chan MessageInfo
+	syncTick     <-chan time.Time
+	fullSyncTick <-chan time.Time
 }
 
 func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
@@ -61,6 +63,10 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 	assertions.AssertNotNil(peerManager, "peer manager cannot be nil")
+
+	if config.FullSyncInterval == 0 {
+		config.FullSyncInterval = config.SyncInterval * 10 // Default to 10x regular sync interval
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: config.LogLevel,
@@ -75,9 +81,10 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 		cancel:    cancel,
 		transport: transport,
 
-		incomingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		outgoingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		syncTick:    time.NewTicker(config.SyncInterval).C,
+		incomingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		outgoingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		syncTick:     time.NewTicker(config.SyncInterval).C,
+		fullSyncTick: time.NewTicker(config.FullSyncInterval).C, // Initialize full sync ticker
 	}
 
 	assertions.AssertNotNil(node.counter, "node counter must be initialized")
