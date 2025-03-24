@@ -9,13 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/ogzhanolguncu/distributed-counter/part0/assertions"
 	"github.com/ogzhanolguncu/distributed-counter/part0/crdt"
 	"github.com/ogzhanolguncu/distributed-counter/part0/protocol"
+	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/sync/errgroup"
 )
 
-const defaultChannelBuffer = 10000
+const defaultChannelBuffer = 10_000
 
 type Config struct {
 	Addr         string
@@ -171,6 +173,35 @@ func (n *Node) prepareCounterMessage(msgType uint8) protocol.Message {
 	}
 }
 
+func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protocol.Message {
+	// Base message with common fields
+	msg := protocol.Message{
+		Type:   msgType,
+		NodeID: n.config.Addr,
+	}
+
+	// For MessageTypeDigestPull, calculate our current digest
+	if msgType == protocol.MessageTypeDigestPull {
+		// Get both increment and decrement counters
+		increments, decrements := n.counter.Counters()
+		counters := []any{increments, decrements}
+		data, err := msgpack.Marshal(counters)
+		if err != nil {
+			n.logger.Error("failed to create digest message", "error", err)
+			return msg
+		}
+
+		msg.Digest = xxhash.Sum64(data)
+	}
+
+	// For MessageTypeDigestAck, use the digest value that was passed in
+	if msgType == protocol.MessageTypeDigestAck && len(digestValue) > 0 {
+		msg.Digest = digestValue[0]
+	}
+
+	return msg
+}
+
 func (n *Node) pullState() {
 	n.peersMu.RLock()
 	peers := n.peers
@@ -195,7 +226,7 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	message := n.prepareCounterMessage(protocol.MessageTypePull)
+	message := n.prepareDigestMessage(protocol.MessageTypeDigestPull)
 
 	for _, peer := range selectedPeers[:numPeers] {
 		peerAddr := peer // Shadow the variable for goroutine
@@ -228,8 +259,11 @@ func (n *Node) pullState() {
 }
 
 func (n *Node) handleIncMsg(inc MessageInfo) {
-	assertions.Assert(inc.message.Type == protocol.MessageTypePull ||
-		inc.message.Type == protocol.MessageTypePush,
+	assertions.Assert(
+		inc.message.Type == protocol.MessageTypePull ||
+			inc.message.Type == protocol.MessageTypePush ||
+			inc.message.Type == protocol.MessageTypeDigestAck ||
+			inc.message.Type == protocol.MessageTypeDigestPull,
 		"invalid message type")
 
 	n.logger.Info("received message",
@@ -238,6 +272,46 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		"nodeID", inc.message.NodeID,
 		"increments", fmt.Sprintf("%v", inc.message.IncrementValues),
 		"decrements", fmt.Sprintf("%v", inc.message.DecrementValues))
+
+	if inc.message.Type == protocol.MessageTypeDigestPull {
+		// Create our counters hash
+		increments, decrements := n.counter.Counters()
+		counters := []any{increments, decrements}
+		data, err := msgpack.Marshal(counters)
+		if err != nil {
+			n.logger.Error("failed to marshal counters", "error", err)
+			return
+		}
+
+		countersHash := xxhash.Sum64(data)
+
+		if countersHash == inc.message.Digest {
+			// Digests match - send ack with matching digest
+			ackMsg := n.prepareDigestMessage(protocol.MessageTypeDigestAck, inc.message.Digest)
+
+			n.logger.Info("digests match, sending ack",
+				"to", inc.addr,
+				"digest", countersHash)
+
+			n.outgoingMsg <- MessageInfo{
+				addr:    inc.addr,
+				message: ackMsg,
+			}
+		} else {
+			// Digests don't match - send full state
+			responseMsg := n.prepareCounterMessage(protocol.MessageTypePush)
+
+			n.logger.Info("digests don't match, sending full state",
+				"to", inc.addr,
+				"local_digest", countersHash,
+				"remote_digest", inc.message.Digest)
+
+			n.outgoingMsg <- MessageInfo{
+				message: responseMsg,
+				addr:    inc.addr,
+			}
+		}
+	}
 
 	// Create a PNCounter from received values
 	tempCounter := crdt.New(inc.message.NodeID)

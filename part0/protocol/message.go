@@ -18,7 +18,7 @@ const (
 	MessageTypeDigestAck  = 0x04 // Acknowledgment when digests match
 	MessageFlagCompressed = 0x80
 
-	CompressionThreshold = 512 // Only compress message larger than this (Bytes)
+	CompressionThreshold = 1024 // Only compress message larger than this (Bytes)
 	DefaultBufferSize    = 4096
 	MaxMessageSize       = 10 * 1024 * 1024 // 10MB max message size
 )
@@ -46,7 +46,7 @@ type Message struct {
 func (m *Message) validate() error {
 	assertions.Assert(m != nil, "Message cannot be nil")
 	// Check message type is valid
-	if m.Type != MessageTypePull && m.Type != MessageTypePush {
+	if m.Type != MessageTypePull && m.Type != MessageTypePush && m.Type != MessageTypeDigestAck && m.Type != MessageTypeDigestPull {
 		return ErrInvalidType
 	}
 
@@ -56,10 +56,8 @@ func (m *Message) validate() error {
 	}
 
 	// For push messages, either increment or decrement values should be present
-	if m.Type == MessageTypePush {
-		if len(m.IncrementValues) == 0 && len(m.DecrementValues) == 0 {
-			return ErrEmptyPNMaps
-		}
+	if m.Type == MessageTypePush && len(m.IncrementValues) == 0 && len(m.DecrementValues) == 0 {
+		return ErrEmptyPNMaps
 	}
 
 	return nil
@@ -150,7 +148,7 @@ func Encode(msg Message) ([]byte, error) {
 	assertions.Assert(msg.NodeID != "", "Node ID cannot be empty")
 
 	// Validate message type
-	assertions.Assert(msg.Type == MessageTypePull || msg.Type == MessageTypePush,
+	assertions.Assert(msg.Type == MessageTypePull || msg.Type == MessageTypePush || msg.Type == MessageTypeDigestAck || msg.Type == MessageTypeDigestPull,
 		"Message type must be either MessageTypePull or MessageTypePush")
 
 	// For push messages, require values
