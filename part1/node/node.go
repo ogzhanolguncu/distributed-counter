@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const defaultChannelBuffer = 100
+const defaultChannelBuffer = 10_000
 
 type Config struct {
 	Addr         string
