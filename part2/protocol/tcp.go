@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part1/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
 )
 
 const (
