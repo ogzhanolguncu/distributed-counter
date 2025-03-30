@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
-	"github.com/ogzhanolguncu/distributed-counter/part2/node"
+	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part3/node"
 )
 
 type DiscoveryClient struct {
@@ -85,8 +85,8 @@ func (dc *DiscoveryClient) Register() error {
 		return fmt.Errorf("discovery server returned status %d for 'Register' ", resp.StatusCode)
 	}
 
-	log.Printf("[Node %s] Registered with discovery server %s (counter=%d, version=%d)",
-		dc.node.GetAddr(), dc.srvAddr, dc.node.GetCounter(), dc.node.GetVersion())
+	log.Printf("[Node %s] Registered with discovery server %s (counter=%d )",
+		dc.node.GetAddr(), dc.srvAddr, dc.node.GetCounter())
 	return nil
 }
 
