@@ -3,7 +3,7 @@ package protocol
 import (
 	"testing"
 
-	"github.com/ogzhanolguncu/distributed-counter/part0/crdt"
+	"github.com/ogzhanolguncu/distributed-counter/part1/crdt"
 	"github.com/stretchr/testify/require"
 )
 
