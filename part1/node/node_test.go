@@ -199,9 +199,9 @@ func TestConcurrentIncrement(t *testing.T) {
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2", "node3"})
-	node2.SetPeers([]string{"node1", "node3"})
-	node3.SetPeers([]string{"node2", "node1"})
+	node1.peers.SetPeers([]string{"node2", "node3"})
+	node2.peers.SetPeers([]string{"node1", "node3"})
+	node3.peers.SetPeers([]string{"node2", "node1"})
 
 	var wg1 sync.WaitGroup
 	var wg2 sync.WaitGroup
@@ -254,14 +254,14 @@ func TestLateJoiningNode(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2"})
+	node1.peers.SetPeers([]string{"node2"})
 
 	for range 50 {
 		node1.Increment()
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	node2.SetPeers([]string{"node1"})
+	node2.peers.SetPeers([]string{"node1"})
 
 	waitForConvergence(t, []*Node{node1, node2}, 50, 2*time.Second)
 
@@ -291,9 +291,9 @@ func TestNetworkPartition(t *testing.T) {
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	node1.SetPeers([]string{"node2", "node3"})
-	node2.SetPeers([]string{"node1", "node3"})
-	node3.SetPeers([]string{"node1", "node2"})
+	node1.peers.SetPeers([]string{"node2", "node3"})
+	node2.peers.SetPeers([]string{"node1", "node3"})
+	node3.peers.SetPeers([]string{"node1", "node2"})
 
 	node1.Increment()
 	node2.Increment()
@@ -304,8 +304,8 @@ func TestNetworkPartition(t *testing.T) {
 	CreateBidirectionalPartition(t, "node1", "node3")
 	CreateBidirectionalPartition(t, "node2", "node3")
 
-	node1.SetPeers([]string{"node2"})
-	node2.SetPeers([]string{"node1"})
+	node1.peers.SetPeers([]string{"node2"})
+	node2.peers.SetPeers([]string{"node1"})
 
 	t.Log("Incrementing node1 and node2 during partition")
 	for range 10 {
@@ -332,9 +332,9 @@ func TestNetworkPartition(t *testing.T) {
 	HealBidirectionalPartition(t, "node1", "node3")
 	HealBidirectionalPartition(t, "node2", "node3")
 
-	node1.SetPeers([]string{"node2", "node3"})
-	node2.SetPeers([]string{"node1", "node3"})
-	node3.SetPeers([]string{"node1", "node2"})
+	node1.peers.SetPeers([]string{"node2", "node3"})
+	node2.peers.SetPeers([]string{"node1", "node3"})
+	node3.peers.SetPeers([]string{"node1", "node2"})
 
 	t.Log("State during convergence after healing:")
 	logDetailedState(t, []*Node{node1, node2, node3})

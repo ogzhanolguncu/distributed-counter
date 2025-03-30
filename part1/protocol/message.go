@@ -14,7 +14,7 @@ import (
 const (
 	MessageTypePush       = 0x01
 	MessageTypeDigestPull = 0x02 // Request with just a digest
-	MessageTypeDigestAck  = 0x02 // Acknowledgment when digests match
+	MessageTypeDigestAck  = 0x03 // Acknowledgment when digests match
 	MessageFlagCompressed = 0x80
 
 	CompressionThreshold = 1024 // Only compress message larger than this (Bytes)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -175,23 +176,23 @@ func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protoc
 		NodeID: n.config.Addr,
 	}
 
-	// For MessageTypeDigestPull, calculate our current digest
-	if msgType == protocol.MessageTypeDigestPull {
-		// Get both increment and decrement counters
-		increments, decrements := n.counter.Counters()
-		counters := []any{increments, decrements}
-		data, err := msgpack.Marshal(counters)
-		if err != nil {
-			n.logger.Error("failed to create digest message", "error", err)
-			return msg
+	// If it's a digest pull or digest ack, set the digest
+	if msgType == protocol.MessageTypeDigestPull || msgType == protocol.MessageTypeDigestAck {
+		// For digest pull, calculate our current digest
+		if msgType == protocol.MessageTypeDigestPull || len(digestValue) == 0 {
+			// Get both increment and decrement counters
+			increments, decrements := n.counter.Counters()
+			data, err := deterministicSerialize(increments, decrements)
+			if err != nil {
+				n.logger.Error("failed to create digest message", "error", err)
+				return msg
+			}
+
+			msg.Digest = xxhash.Sum64(data)
+		} else {
+			// For digest ack, use the provided digest value
+			msg.Digest = digestValue[0]
 		}
-
-		msg.Digest = xxhash.Sum64(data)
-	}
-
-	// For MessageTypeDigestAck, use the digest value that was passed in
-	if msgType == protocol.MessageTypeDigestAck && len(digestValue) > 0 {
-		msg.Digest = digestValue[0]
 	}
 
 	return msg
@@ -267,13 +268,13 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		"increments", fmt.Sprintf("%v", inc.message.IncrementValues),
 		"decrements", fmt.Sprintf("%v", inc.message.DecrementValues))
 
-	if inc.message.Type == protocol.MessageTypeDigestPull {
+	switch inc.message.Type {
+	case protocol.MessageTypeDigestPull:
 		// Create our counters hash
 		increments, decrements := n.counter.Counters()
-		counters := []any{increments, decrements}
-		data, err := msgpack.Marshal(counters)
+		data, err := deterministicSerialize(increments, decrements)
 		if err != nil {
-			n.logger.Error("failed to marshal counters", "error", err)
+			n.logger.Error("failed to serialize counters", "error", err)
 			return
 		}
 
@@ -305,23 +306,32 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 				addr:    inc.addr,
 			}
 		}
-	}
+	case protocol.MessageTypeDigestAck:
+		n.logger.Info("received digest acknowledgment",
+			"from", inc.addr,
+			"digest", inc.message.Digest)
+		return
 
-	// Create a PNCounter from received values
-	tempCounter := crdt.New(inc.message.NodeID)
-	tempCounter.MergeIncrements(inc.message.IncrementValues)
-	tempCounter.MergeDecrements(inc.message.DecrementValues)
+	case protocol.MessageTypePush:
+		n.logger.Info("received push message with full state",
+			"from", inc.addr,
+			"nodeID", inc.message.NodeID)
 
-	// Merge with our local counter
-	updated := n.counter.Merge(tempCounter)
+		// For push messages, create a counter and merge it
+		tempCounter := crdt.New(inc.message.NodeID)
+		tempCounter.MergeIncrements(inc.message.IncrementValues)
+		tempCounter.MergeDecrements(inc.message.DecrementValues)
 
-	if updated {
-		increments, decrements := n.counter.Counters()
+		// Merge with our local counter
+		updated := n.counter.Merge(tempCounter)
 
-		n.logger.Info("counter updated after merge",
-			"total", n.counter.Value(),
-			"increments", fmt.Sprintf("%v", increments),
-			"decrements", fmt.Sprintf("%v", decrements))
+		if updated {
+			increments, decrements := n.counter.Counters()
+			n.logger.Info("counter updated after merge",
+				"total", n.counter.Value(),
+				"increments", fmt.Sprintf("%v", increments),
+				"decrements", fmt.Sprintf("%v", decrements))
+		}
 	}
 }
 
@@ -381,4 +391,42 @@ func (n *Node) Close() error {
 func (n *Node) GetPeerManager() *peer.PeerManager {
 	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
 	return n.peers
+}
+
+// Create ordered slices for both increments and decrements
+type CounterEntry struct {
+	NodeID string
+	Value  uint64
+}
+
+func deterministicSerialize(increments, decrements crdt.PNMap) ([]byte, error) {
+	// Combine all keys from both maps to get the complete set of node IDs
+	allNodeIDs := make(map[string]struct{})
+	for nodeID := range increments {
+		allNodeIDs[nodeID] = struct{}{}
+	}
+	for nodeID := range decrements {
+		allNodeIDs[nodeID] = struct{}{}
+	}
+
+	// Create a sorted slice of all node IDs
+	sortedNodeIDs := make([]string, 0, len(allNodeIDs))
+	for nodeID := range allNodeIDs {
+		sortedNodeIDs = append(sortedNodeIDs, nodeID)
+	}
+	sort.Strings(sortedNodeIDs)
+
+	orderedIncrements := make([]CounterEntry, len(sortedNodeIDs))
+	orderedDecrements := make([]CounterEntry, len(sortedNodeIDs))
+
+	for i, nodeID := range sortedNodeIDs {
+		// Use the value if it exists, or 0 if it doesn't
+		incValue := increments[nodeID] // Will be 0 if key doesn't exist
+		decValue := decrements[nodeID] // Will be 0 if key doesn't exist
+
+		orderedIncrements[i] = CounterEntry{NodeID: nodeID, Value: incValue}
+		orderedDecrements[i] = CounterEntry{NodeID: nodeID, Value: decValue}
+	}
+
+	return msgpack.Marshal([]any{orderedIncrements, orderedDecrements})
 }
