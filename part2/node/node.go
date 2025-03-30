@@ -108,12 +108,20 @@ func (n *Node) startTransport() error {
 
 		msg, err := protocol.Decode(data)
 		if err != nil {
+			n.logger.Error("failed to decode incoming message",
+				"node", n.config.Addr,
+				"from", addr,
+				"error", err)
 			return fmt.Errorf("failed to read message: %w", err)
 		}
 		select {
 		case n.incomingMsg <- MessageInfo{message: *msg, addr: addr}:
+			// Message queued successfully
 		default:
-			n.logger.Warn("dropping message, channel is full", "from", addr)
+			n.logger.Warn("dropping incoming message, channel is full",
+				"node", n.config.Addr,
+				"from", addr,
+				"message_type", msg.Type)
 		}
 		return nil
 	})
@@ -128,7 +136,7 @@ func (n *Node) eventLoop() {
 	for {
 		select {
 		case <-n.ctx.Done():
-			n.logger.Info("shutting down", "counter", n.counter.Value())
+			n.logCounterState("node shutting down")
 			return
 
 		case msg := <-n.incomingMsg:
@@ -138,20 +146,57 @@ func (n *Node) eventLoop() {
 			assertions.Assert(msg.addr != "", "outgoing addr cannot be empty")
 			data, err := protocol.Encode(msg.message)
 			if err != nil {
-				n.logger.Error("failed to encode message",
-					"to", msg.addr,
+				n.logger.Error("failed to encode outgoing message",
+					"node", n.config.Addr,
+					"target", msg.addr,
+					"message_type", msg.message.Type,
 					"error", err)
 				continue
 			}
 
 			if err := n.transport.Send(msg.addr, data); err != nil {
 				n.logger.Error("failed to send message",
-					"to", msg.addr,
+					"node", n.config.Addr,
+					"target", msg.addr,
+					"message_type", msg.message.Type,
 					"error", err)
 			}
 
 		case <-n.syncTick:
-			n.pullState()
+			n.initiateDigestSync()
+		case <-n.fullSyncTick:
+			n.performFullStateSync()
+		}
+	}
+}
+
+func (n *Node) performFullStateSync() {
+	peers := n.peers.GetPeers()
+	if len(peers) == 0 {
+		n.logger.Info("skipping full state sync - no peers available", "node", n.config.Addr)
+		return
+	}
+
+	// Select a subset of random peers for full state sync
+	numPeers := max(1, min(n.config.MaxSyncPeers/2, len(peers)))
+	selectedPeers := make([]string, len(peers))
+	copy(selectedPeers, peers)
+	rand.Shuffle(len(selectedPeers), func(i, j int) {
+		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
+	})
+
+	// Prepare full state message
+	message := n.prepareCounterMessage(protocol.MessageTypePush)
+
+	n.logCounterState("performing full state sync (anti-entropy)",
+		"peers_count", numPeers,
+		"selected_peers", selectedPeers[:numPeers])
+
+	// Send to selected peers
+	for _, peer := range selectedPeers[:numPeers] {
+		n.outgoingMsg <- MessageInfo{
+			message: message,
+			addr:    peer,
 		}
 	}
 }
@@ -184,7 +229,10 @@ func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protoc
 			increments, decrements := n.counter.Counters()
 			data, err := deterministicSerialize(increments, decrements)
 			if err != nil {
-				n.logger.Error("failed to create digest message", "error", err)
+				n.logger.Error("failed to create digest message",
+					"node", n.config.Addr,
+					"message_type", msgType,
+					"error", err)
 				return msg
 			}
 
@@ -198,13 +246,11 @@ func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protoc
 	return msg
 }
 
-func (n *Node) pullState() {
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
-
+func (n *Node) initiateDigestSync() {
 	peers := n.peers.GetPeers()
 
 	if len(peers) == 0 {
-		n.logger.Info("no peers available for sync")
+		n.logger.Info("skipping digest sync - no peers available", "node", n.config.Addr)
 		return
 	}
 
@@ -224,18 +270,17 @@ func (n *Node) pullState() {
 
 	message := n.prepareDigestMessage(protocol.MessageTypeDigestPull)
 
+	n.logCounterState("initiating digest sync",
+		"selected_peers", selectedPeers[:numPeers],
+		"digest", message.Digest)
+
 	for _, peer := range selectedPeers[:numPeers] {
 		peerAddr := peer // Shadow the variable for goroutine
 		g.Go(func() error {
-			// Get both increment and decrement counters for logging
-			increments, decrements := n.counter.Counters()
-
-			n.logger.Info("pulling state",
-				"from", peerAddr,
-				"type", message.Type,
-				"counter", n.counter.Value(),
-				"increments", fmt.Sprintf("%v", increments),
-				"decrements", fmt.Sprintf("%v", decrements))
+			n.logger.Info("sending digest pull",
+				"node", n.config.Addr,
+				"target", peerAddr,
+				"digest", message.Digest)
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
@@ -250,7 +295,9 @@ func (n *Node) pullState() {
 	}
 
 	if err := g.Wait(); err != nil {
-		n.logger.Error("sync round failed", "error", err)
+		n.logger.Error("sync round failed",
+			"node", n.config.Addr,
+			"error", err)
 	}
 }
 
@@ -262,11 +309,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		"invalid message type")
 
 	n.logger.Info("received message",
+		"node", n.config.Addr,
 		"from", inc.addr,
-		"type", inc.message.Type,
-		"nodeID", inc.message.NodeID,
-		"increments", fmt.Sprintf("%v", inc.message.IncrementValues),
-		"decrements", fmt.Sprintf("%v", inc.message.DecrementValues))
+		"message_type", inc.message.Type,
+		"remote_node_id", inc.message.NodeID)
 
 	switch inc.message.Type {
 	case protocol.MessageTypeDigestPull:
@@ -274,7 +320,10 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		increments, decrements := n.counter.Counters()
 		data, err := deterministicSerialize(increments, decrements)
 		if err != nil {
-			n.logger.Error("failed to serialize counters", "error", err)
+			n.logger.Error("failed to serialize counters",
+				"node", n.config.Addr,
+				"counter_value", n.counter.Value(),
+				"error", err)
 			return
 		}
 
@@ -284,9 +333,11 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			// Digests match - send ack with matching digest
 			ackMsg := n.prepareDigestMessage(protocol.MessageTypeDigestAck, inc.message.Digest)
 
-			n.logger.Info("digests match, sending ack",
-				"to", inc.addr,
-				"digest", countersHash)
+			n.logger.Info("sending digest acknowledgment (digests match)",
+				"node", n.config.Addr,
+				"target", inc.addr,
+				"digest", countersHash,
+				"counter_value", n.counter.Value())
 
 			n.outgoingMsg <- MessageInfo{
 				addr:    inc.addr,
@@ -296,10 +347,12 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 			// Digests don't match - send full state
 			responseMsg := n.prepareCounterMessage(protocol.MessageTypePush)
 
-			n.logger.Info("digests don't match, sending full state",
-				"to", inc.addr,
+			n.logger.Info("sending full state (digests don't match)",
+				"node", n.config.Addr,
+				"target", inc.addr,
 				"local_digest", countersHash,
-				"remote_digest", inc.message.Digest)
+				"remote_digest", inc.message.Digest,
+				"counter_value", n.counter.Value())
 
 			n.outgoingMsg <- MessageInfo{
 				message: responseMsg,
@@ -308,14 +361,14 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		}
 	case protocol.MessageTypeDigestAck:
 		n.logger.Info("received digest acknowledgment",
+			"node", n.config.Addr,
 			"from", inc.addr,
-			"digest", inc.message.Digest)
+			"digest", inc.message.Digest,
+			"counter_value", n.counter.Value())
 		return
 
 	case protocol.MessageTypePush:
-		n.logger.Info("received push message with full state",
-			"from", inc.addr,
-			"nodeID", inc.message.NodeID)
+		oldValue := n.counter.Value()
 
 		// For push messages, create a counter and merge it
 		tempCounter := crdt.New(inc.message.NodeID)
@@ -326,11 +379,20 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 		updated := n.counter.Merge(tempCounter)
 
 		if updated {
+			newValue := n.counter.Value()
 			increments, decrements := n.counter.Counters()
 			n.logger.Info("counter updated after merge",
-				"total", n.counter.Value(),
-				"increments", fmt.Sprintf("%v", increments),
-				"decrements", fmt.Sprintf("%v", decrements))
+				"node", n.config.Addr,
+				"from", oldValue,
+				"to", newValue,
+				"increments", increments,
+				"decrements", decrements,
+				"from_node", inc.message.NodeID)
+		} else {
+			n.logger.Info("received push message (no changes)",
+				"node", n.config.Addr,
+				"from", inc.addr,
+				"counter_value", n.counter.Value())
 		}
 	}
 }
@@ -344,10 +406,11 @@ func (n *Node) Increment() {
 	increments, decrements := n.counter.Counters()
 
 	n.logger.Info("incremented counter",
+		"node", n.config.Addr,
 		"from", oldValue,
 		"to", newValue,
-		"increments", fmt.Sprintf("%v", increments),
-		"decrements", fmt.Sprintf("%v", decrements))
+		"increments", increments,
+		"decrements", decrements)
 }
 
 func (n *Node) Decrement() {
@@ -359,10 +422,11 @@ func (n *Node) Decrement() {
 	increments, decrements := n.counter.Counters()
 
 	n.logger.Info("decremented counter",
+		"node", n.config.Addr,
 		"from", oldValue,
 		"to", newValue,
-		"increments", fmt.Sprintf("%v", increments),
-		"decrements", fmt.Sprintf("%v", decrements))
+		"increments", increments,
+		"decrements", decrements)
 }
 
 func (n *Node) GetCounter() int64 {
@@ -393,7 +457,21 @@ func (n *Node) GetPeerManager() *peer.PeerManager {
 	return n.peers
 }
 
-// Create ordered slices for both increments and decrements
+func (n *Node) logCounterState(msg string, additionalFields ...any) {
+	increments, decrements := n.counter.Counters()
+	fields := []any{
+		"node", n.config.Addr,
+		"counter_value", n.counter.Value(),
+		"increments", increments,
+		"decrements", decrements,
+	}
+
+	// Append any additional context fields
+	fields = append(fields, additionalFields...)
+
+	n.logger.Info(msg, fields...)
+}
+
 type CounterEntry struct {
 	NodeID string
 	Value  uint64
