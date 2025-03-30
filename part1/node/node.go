@@ -6,13 +6,12 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/ogzhanolguncu/distributed-counter/part1/assertions"
 	"github.com/ogzhanolguncu/distributed-counter/part1/crdt"
-	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
 	"github.com/ogzhanolguncu/distributed-counter/part1/protocol"
 	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/sync/errgroup"
@@ -22,15 +21,10 @@ const defaultChannelBuffer = 10_000
 
 type Config struct {
 	Addr             string
+	MaxSyncPeers     int
 	SyncInterval     time.Duration
 	FullSyncInterval time.Duration
-	MaxSyncPeers     int
 	LogLevel         slog.Level
-}
-
-type State struct {
-	counter atomic.Uint64
-	version atomic.Uint32
 }
 
 type MessageInfo struct {
@@ -43,7 +37,8 @@ type Node struct {
 	counter *crdt.PNCounter
 	logger  *slog.Logger
 
-	peers *peer.PeerManager
+	peers   []string
+	peersMu sync.RWMutex
 
 	transport protocol.Transport
 	ctx       context.Context
@@ -55,14 +50,32 @@ type Node struct {
 	fullSyncTick <-chan time.Time
 }
 
-func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
+func (n *Node) SetPeers(peers []string) {
+	assertions.Assert(len(peers) > 0, "arg peers cannot be empty")
+
+	n.peersMu.Lock()
+	defer n.peersMu.Unlock()
+	n.peers = make([]string, len(peers))
+	copy(n.peers, peers)
+
+	assertions.AssertEqual(len(n.peers), len(peers), "node's peers should be equal to peers")
+}
+
+func (n *Node) GetPeers() []string {
+	n.peersMu.RLock()
+	defer n.peersMu.RUnlock()
+	peers := make([]string, len(n.peers))
+	copy(peers, n.peers)
+	return peers
+}
+
+func NewNode(config Config, transport protocol.Transport) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
 	assertions.Assert(config.MaxSyncPeers > 0, "max sync peers must be positive")
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
-	assertions.AssertNotNil(peerManager, "peer manager cannot be nil")
 
 	if config.FullSyncInterval == 0 {
 		config.FullSyncInterval = config.SyncInterval * 10 // Default to 10x regular sync interval
@@ -75,8 +88,8 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	node := &Node{
 		config:    config,
 		counter:   crdt.New(config.Addr),
-		peers:     peerManager,
 		logger:    logger,
+		peers:     make([]string, 0),
 		ctx:       ctx,
 		cancel:    cancel,
 		transport: transport,
@@ -150,7 +163,41 @@ func (n *Node) eventLoop() {
 			}
 
 		case <-n.syncTick:
-			n.pullState()
+			n.initiateDigestSync()
+		case <-n.fullSyncTick:
+			n.performFullStateSync()
+		}
+	}
+}
+
+func (n *Node) performFullStateSync() {
+	peers := n.GetPeers()
+	if len(peers) == 0 {
+		n.logger.Info("no peers available for full state sync")
+		return
+	}
+
+	// Select a subset of random peers for full state sync
+	numPeers := max(1, min(n.config.MaxSyncPeers/2, len(peers)))
+	selectedPeers := make([]string, len(peers))
+	copy(selectedPeers, peers)
+	rand.Shuffle(len(selectedPeers), func(i, j int) {
+		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
+	})
+
+	// Prepare full state message
+	message := n.prepareCounterMessage(protocol.MessageTypePush)
+
+	// Log the operation
+	n.logger.Info("performing full state sync (anti-entropy)",
+		"peers_count", numPeers,
+		"counter_value", n.counter.Value())
+
+	// Send to selected peers
+	for _, peer := range selectedPeers[:numPeers] {
+		n.outgoingMsg <- MessageInfo{
+			message: message,
+			addr:    peer,
 		}
 	}
 }
@@ -197,10 +244,10 @@ func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protoc
 	return msg
 }
 
-func (n *Node) pullState() {
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
-
-	peers := n.peers.GetPeers()
+func (n *Node) initiateDigestSync() {
+	n.peersMu.RLock()
+	peers := n.peers
+	n.peersMu.RUnlock()
 
 	if len(peers) == 0 {
 		n.logger.Info("no peers available for sync")
@@ -376,9 +423,4 @@ func (n *Node) Close() error {
 
 	n.cancel()
 	return n.transport.Close()
-}
-
-func (n *Node) GetPeerManager() *peer.PeerManager {
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
-	return n.peers
 }

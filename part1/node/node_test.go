@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part1/peer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -190,9 +189,7 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node
 		SyncInterval: syncInterval,
 		MaxSyncPeers: 2,
 	}
-
-	peerManager := peer.NewPeerManager()
-	node, err := NewNode(config, transport, peerManager)
+	node, err := NewNode(config, transport)
 	require.NoError(t, err)
 	return node
 }
@@ -202,14 +199,9 @@ func TestConcurrentIncrement(t *testing.T) {
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	node1.peers.AddPeer("node2")
-	node1.peers.AddPeer("node3")
-
-	node2.peers.AddPeer("node1")
-	node2.peers.AddPeer("node3")
-
-	node3.peers.AddPeer("node2")
-	node3.peers.AddPeer("node1")
+	node1.SetPeers([]string{"node2", "node3"})
+	node2.SetPeers([]string{"node1", "node3"})
+	node3.SetPeers([]string{"node2", "node1"})
 
 	var wg1 sync.WaitGroup
 	var wg2 sync.WaitGroup
@@ -262,14 +254,14 @@ func TestLateJoiningNode(t *testing.T) {
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 
-	node1.peers.AddPeer("node2")
+	node1.SetPeers([]string{"node2"})
 
 	for range 50 {
 		node1.Increment()
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	node2.peers.AddPeer("node1")
+	node2.SetPeers([]string{"node1"})
 
 	waitForConvergence(t, []*Node{node1, node2}, 50, 2*time.Second)
 
@@ -295,36 +287,25 @@ func TestLateJoiningNode(t *testing.T) {
 }
 
 func TestNetworkPartition(t *testing.T) {
-	// Create three nodes with short sync intervals for faster testing
 	node1 := createTestNode(t, "node1", 100*time.Millisecond)
 	node2 := createTestNode(t, "node2", 100*time.Millisecond)
 	node3 := createTestNode(t, "node3", 100*time.Millisecond)
 
-	// Set up the peer connections
-	node1.GetPeerManager().AddPeer("node2")
-	node1.GetPeerManager().AddPeer("node3")
-	node2.GetPeerManager().AddPeer("node1")
-	node2.GetPeerManager().AddPeer("node3")
-	node3.GetPeerManager().AddPeer("node1")
-	node3.GetPeerManager().AddPeer("node2")
+	node1.SetPeers([]string{"node2", "node3"})
+	node2.SetPeers([]string{"node1", "node3"})
+	node3.SetPeers([]string{"node1", "node2"})
 
-	// Initial increments to ensure the network is working
 	node1.Increment()
 	node2.Increment()
 	node3.Increment()
 
-	// Wait for initial convergence
 	waitForConvergence(t, []*Node{node1, node2, node3}, 3, 2*time.Second)
 
-	// Create a network partition - isolate node3 from node1 and node2
 	CreateBidirectionalPartition(t, "node1", "node3")
 	CreateBidirectionalPartition(t, "node2", "node3")
 
-	// Update the peer managers to reflect the network partition
-	node1.GetPeerManager().RemovePeer("node3")
-	node2.GetPeerManager().RemovePeer("node3")
-	node3.GetPeerManager().RemovePeer("node1")
-	node3.GetPeerManager().RemovePeer("node2")
+	node1.SetPeers([]string{"node2"})
+	node2.SetPeers([]string{"node1"})
 
 	t.Log("Incrementing node1 and node2 during partition")
 	for range 10 {
@@ -339,10 +320,8 @@ func TestNetworkPartition(t *testing.T) {
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	// Wait for node1 and node2 to converge (they're still connected to each other)
 	waitForConvergence(t, []*Node{node1, node2}, 23, 2*time.Second)
 
-	// Check node3's state during isolation
 	require.Equal(t, int64(8), node3.GetCounter(),
 		"Node3 should have 8 total increments during partition (3 initial + 5 new)")
 
@@ -350,31 +329,26 @@ func TestNetworkPartition(t *testing.T) {
 	logDetailedState(t, []*Node{node1, node2, node3})
 
 	t.Log("Healing network partition")
-	// Restore network connectivity
 	HealBidirectionalPartition(t, "node1", "node3")
 	HealBidirectionalPartition(t, "node2", "node3")
 
-	// Restore peer configurations
-	node1.GetPeerManager().AddPeer("node3")
-	node2.GetPeerManager().AddPeer("node3")
-	node3.GetPeerManager().AddPeer("node1")
-	node3.GetPeerManager().AddPeer("node2")
+	node1.SetPeers([]string{"node2", "node3"})
+	node2.SetPeers([]string{"node1", "node3"})
+	node3.SetPeers([]string{"node1", "node2"})
 
 	t.Log("State during convergence after healing:")
 	logDetailedState(t, []*Node{node1, node2, node3})
 
-	// Wait for all nodes to converge after the partition is healed
-	// Total should be 28: 3 initial + 10 from node1 + 10 from node2 + 5 from node3
 	waitForConvergence(t, []*Node{node1, node2, node3}, 28, 5*time.Second)
 
 	t.Log("Final state after convergence:")
 	logDetailedState(t, []*Node{node1, node2, node3})
 
-	// Clean up
 	node1.Close()
 	node2.Close()
 	node3.Close()
-	time.Sleep(500 * time.Millisecond) // Allow time for graceful shutdown
+
+	time.Sleep(500 * time.Millisecond)
 }
 
 func logDetailedState(t *testing.T, nodes []*Node) {

@@ -2,12 +2,14 @@ package node
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part2/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part2/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part3/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part3/protocol"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,6 +77,31 @@ func waitForConvergence(t *testing.T, nodes []*Node, expectedCounter uint64, exp
 	}
 	t.Fatalf("nodes did not converge within timeout. Expected counter=%d, version=%d",
 		expectedCounter, expectedVersion)
+}
+
+func createTestNodeWithWAL(t *testing.T, addr string, syncInterval time.Duration, maxPeerFail int, failureDuration time.Duration, walDir string) *Node {
+	transport := NewMemoryTransport(addr)
+
+	err := os.MkdirAll(walDir, 0755)
+	require.NoError(t, err)
+
+	config := Config{
+		Addr:                addr,
+		SyncInterval:        syncInterval,
+		MaxSyncPeers:        2,
+		MaxConsecutiveFails: maxPeerFail,
+		FailureTimeout:      failureDuration,
+		// WAL configuration
+		WalDir:         walDir,
+		EnableWal:      true,
+		EnableWalFsync: true,
+		MaxWalFileSize: 1 * 1024 * 1024,
+	}
+
+	peerManager := peer.NewPeerManager(maxPeerFail, failureDuration)
+	node, err := NewNode(config, transport, peerManager)
+	require.NoError(t, err)
+	return node
 }
 
 func createTestNode(t *testing.T, addr string, syncInterval time.Duration, maxPeerFail int, failureDuration time.Duration) *Node {
@@ -294,4 +321,87 @@ func TestMessageInactiveNode(t *testing.T) {
 	node1.Close()
 	node2.Close()
 	time.Sleep(200 * time.Millisecond)
+}
+
+func TestMultiNodeWALConsistency(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "wal-multi-test-")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	numNodes := 5
+	nodes := make([]*Node, numNodes)
+
+	for i := range numNodes {
+		addr := fmt.Sprintf("node%d", i)
+		walDir := filepath.Join(tempDir, addr)
+		nodes[i] = createTestNodeWithWAL(t, addr, 50*time.Millisecond, 1, 2*time.Second, walDir)
+	}
+
+	for i := range numNodes {
+		for j := range numNodes {
+			if i != j {
+				nodes[i].peers.AddPeer(fmt.Sprintf("node%d", j))
+			}
+		}
+	}
+
+	t.Log("Performing increments")
+	nodes[0].Increment()
+
+	time.Sleep(100 * time.Millisecond)
+
+	nodes[2].Increment()
+
+	time.Sleep(100 * time.Millisecond)
+
+	nodes[4].Increment()
+
+	t.Log("Waiting for first convergence")
+	waitForConvergence(t, nodes, 3, 3, 10*time.Second)
+
+	t.Log("Node states after first convergence:")
+	for i, node := range nodes {
+		t.Logf("Node %d: counter=%d, version=%d", i, node.GetCounter(), node.GetVersion())
+	}
+
+	t.Log("Closing nodes 1 and 3")
+	require.NoError(t, nodes[1].Close())
+	require.NoError(t, nodes[3].Close())
+
+	t.Log("Restarting nodes 1 and 3")
+	walDir1 := filepath.Join(tempDir, "node1")
+	walDir3 := filepath.Join(tempDir, "node3")
+
+	nodes[1] = createTestNodeWithWAL(t, "node1", 50*time.Millisecond, 1, 2*time.Second, walDir1)
+	nodes[3] = createTestNodeWithWAL(t, "node3", 50*time.Millisecond, 1, 2*time.Second, walDir3)
+
+	for j := range numNodes {
+		if j != 1 {
+			nodes[1].peers.AddPeer(fmt.Sprintf("node%d", j))
+		}
+		if j != 3 {
+			nodes[3].peers.AddPeer(fmt.Sprintf("node%d", j))
+		}
+	}
+
+	require.Equal(t, uint64(3), nodes[1].GetCounter(), "Restarted node should recover counter value")
+	require.Equal(t, uint32(3), nodes[1].GetVersion(), "Restarted node should recover version")
+	require.Equal(t, uint64(3), nodes[3].GetCounter(), "Restarted node should recover counter value")
+	require.Equal(t, uint32(3), nodes[3].GetVersion(), "Restarted node should recover version")
+
+	t.Log("Performing additional increment")
+	nodes[2].Increment()
+
+	t.Log("Waiting for final convergence")
+	waitForConvergence(t, nodes, 4, 4, 10*time.Second)
+
+	t.Log("Final node states:")
+	for i, node := range nodes {
+		t.Logf("Node %d: counter=%d, version=%d", i, node.GetCounter(), node.GetVersion())
+	}
+
+	t.Log("Closing all nodes")
+	for i := range numNodes {
+		nodes[i].Close()
+	}
 }

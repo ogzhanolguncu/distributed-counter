@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/ogzhanolguncu/distributed-counter/part1/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
 )
 
 const (

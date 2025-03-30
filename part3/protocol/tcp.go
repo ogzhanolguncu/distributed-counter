@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part1/assertions"
 )
 
 type TCPTransport struct {

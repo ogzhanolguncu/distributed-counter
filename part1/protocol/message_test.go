@@ -3,7 +3,7 @@ package protocol
 import (
 	"testing"
 
-	"github.com/ogzhanolguncu/distributed-counter/part1/crdt"
+	"github.com/ogzhanolguncu/distributed-counter/part0/crdt"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,7 +90,7 @@ func TestCriticalEdgeCases(t *testing.T) {
 func TestCompressionAndEncodeDecode(t *testing.T) {
 	// Create a message that should exceed compression threshold
 	largeMap := make(crdt.PNMap)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		key := "key" + string(rune('A'+i))
 		largeMap[key] = uint64(i * 100)
 	}

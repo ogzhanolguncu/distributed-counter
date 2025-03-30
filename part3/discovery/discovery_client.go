@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
-	"github.com/ogzhanolguncu/distributed-counter/part3/node"
+	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part2/node"
 )
 
 type DiscoveryClient struct {
