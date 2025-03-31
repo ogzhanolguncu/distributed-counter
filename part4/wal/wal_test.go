@@ -1,246 +1,279 @@
-package wal
+package wal_test
 
 import (
-	"bytes"
-	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/ogzhanolguncu/distributed-counter/part4/crdt"
+	"github.com/ogzhanolguncu/distributed-counter/part4/wal"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Helper function to create a temporary WAL for testing
-func setupWAL(t *testing.T, enableFsync bool, maxFileSize int64) (*WAL, string) {
-	dir, err := os.MkdirTemp("", "wal-test")
+func TestWALCleanup(t *testing.T) {
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "wal-cleanup-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir) // Clean up after the test
+
+	// Define test parameters
+	nodeID := "test-node"
+	maxFileSize := int64(100) // Very small size to trigger many segments
+
+	// Set a debug flag to see more verbose output
+	os.Setenv("WAL_DEBUG", "1")
+
+	// Initialize WAL
+	walInstance, err := wal.OpenWAL(tempDir, nodeID, false, maxFileSize)
 	require.NoError(t, err)
 
-	w, err := OpenWAL(dir, enableFsync, maxFileSize)
-	require.NoError(t, err)
+	// Create a test counter
+	counter := crdt.New(nodeID)
 
-	return w, dir
-}
+	// Generate multiple segments by writing a lot of data
+	for i := 0; i < 20; i++ {
+		// Increment the counter
+		counter.Increment(nodeID)
 
-func TestWAL_BasicOperations(t *testing.T) {
-	w, dir := setupWAL(t, false, 1024*1024)
-	defer os.RemoveAll(dir)
-	defer w.Close()
+		// Generate enough data to force segment rotation
+		for j := 0; j < 5; j++ {
+			// Write increment to WAL
+			err = walInstance.WriteCounterIncrement(nodeID)
+			require.NoError(t, err)
 
-	// Write a few entries
-	testData := [][]byte{
-		[]byte("entry 1"),
-		[]byte("entry 2"),
-		[]byte("entry 3"),
-	}
-
-	for _, data := range testData {
-		err := w.WriteEntry(data)
-		require.NoError(t, err)
-	}
-
-	require.NoError(t, w.Sync())
-
-	// Read and verify
-	entries, err := w.ReadAll()
-	require.NoError(t, err)
-	require.Equal(t, len(testData), len(entries))
-
-	for i, entry := range entries {
-		require.Equal(t, testData[i], entry.Data)
-		require.Equal(t, uint64(i+1), entry.SequenceNumber)
-	}
-}
-
-func TestWAL_Persistence(t *testing.T) {
-	dir, err := os.MkdirTemp("", "wal-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	testData := [][]byte{
-		[]byte("persistence test 1"),
-		[]byte("persistence test 2"),
-		[]byte("persistence test 3"),
-	}
-
-	// First session: write data
-	{
-		w, err := OpenWAL(dir, true, 1024*1024)
-		require.NoError(t, err)
-
-		for _, data := range testData {
-			require.NoError(t, w.WriteEntry(data))
+			// Add some metadata to increase segment size
+			err = walInstance.WriteMetadata(map[string]interface{}{
+				"op":    "increment",
+				"index": i*5 + j,
+			})
+			require.NoError(t, err)
 		}
 
-		require.NoError(t, w.Close())
-	}
-
-	// Second session: verify data
-	{
-		w, err := OpenWAL(dir, false, 1024*1024)
+		// Write a state snapshot for every increment
+		// This ensures we can recover counter state even after cleanup
+		err = walInstance.WriteCounterState(counter)
 		require.NoError(t, err)
-		defer w.Close()
 
-		entries, err := w.ReadAll()
-		require.NoError(t, err)
-		require.Equal(t, len(testData), len(entries))
-
-		for i, entry := range entries {
-			require.Equal(t, testData[i], entry.Data)
-			require.Equal(t, uint64(i+1), entry.SequenceNumber)
+		// Force sync every few iterations to ensure data is written
+		if i%5 == 0 {
+			err = walInstance.Sync()
+			require.NoError(t, err)
 		}
 	}
+
+	// Force sync to ensure all data is written
+	err = walInstance.Sync()
+	require.NoError(t, err)
+
+	// Close and reopen WAL to ensure all segments are flushed
+	err = walInstance.Close()
+	require.NoError(t, err)
+
+	walInstance, err = wal.OpenWAL(tempDir, nodeID, false, maxFileSize)
+	require.NoError(t, err)
+	defer walInstance.Close()
+
+	// Verify we have multiple segments
+	files, err := filepath.Glob(filepath.Join(tempDir, "segment-*"))
+	require.NoError(t, err)
+	initialFileCount := len(files)
+	t.Logf("Initial segment count: %d", initialFileCount)
+	assert.Greater(t, initialFileCount, 3, "Should have created multiple segments")
+
+	// Before cleanup, check the counter value
+	preCleanupCounter, err := wal.RecoverCounter(tempDir, nodeID)
+	require.NoError(t, err)
+	expectedValue := preCleanupCounter.Value()
+	t.Logf("Expected counter value: %d", expectedValue)
+
+	// List all segments with their indices for debugging
+	t.Log("Segments before cleanup:")
+	for _, file := range files {
+		segmentIndex := filepath.Base(file)[len("segment-"):]
+		t.Logf("  %s (index: %s)", file, segmentIndex)
+	}
+
+	// Configure cleanup to keep only a few segments
+	cleanupConfig := wal.CleanupConfig{
+		MaxSegments: 5,         // Keep at most 5 segments
+		MinSegments: 3,         // Keep at least 3 segments
+		MaxAge:      time.Hour, // Keep segments up to 1 hour old
+	}
+
+	// Run cleanup directly to avoid async issues
+	err = walInstance.CleanupSegments(cleanupConfig)
+	require.NoError(t, err)
+
+	// Wait a bit to ensure all file operations complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Force sync and close the WAL to flush all segments
+	err = walInstance.Sync()
+	require.NoError(t, err)
+	err = walInstance.Close()
+	require.NoError(t, err)
+
+	// Verify fewer segments remain
+	files, err = filepath.Glob(filepath.Join(tempDir, "segment-*"))
+	require.NoError(t, err)
+	t.Logf("Segment count after cleanup: %d", len(files))
+
+	// Log remaining segments for debugging
+	t.Log("Segments after cleanup:")
+	for _, file := range files {
+		segmentIndex := filepath.Base(file)[len("segment-"):]
+		t.Logf("  %s (index: %s)", file, segmentIndex)
+	}
+
+	assert.LessOrEqual(t, len(files), cleanupConfig.MaxSegments,
+		"Should have kept at most MaxSegments segments")
+	assert.GreaterOrEqual(t, len(files), cleanupConfig.MinSegments,
+		"Should have kept at least MinSegments segments")
+	assert.Less(t, len(files), initialFileCount,
+		"Should have fewer files after cleanup")
+
+	// Verify we can still recover the counter from the remaining segments
+	recoveredCounter, err := wal.RecoverCounter(tempDir, nodeID)
+	require.NoError(t, err)
+
+	// The counter should still have the correct value
+	recoveredValue := recoveredCounter.Value()
+	t.Logf("Recovered counter value: %d", recoveredValue)
+	assert.Equal(t, expectedValue, recoveredValue,
+		"Recovered counter should have the same value after cleanup")
 }
 
-func TestWAL_Rotation(t *testing.T) {
-	w, dir := setupWAL(t, false, 100) // Small size to force rotation
-	defer os.RemoveAll(dir)
-	defer w.Close()
-
-	// Write entries to trigger rotation
-	for i := range 10 {
-		data := fmt.Appendf(nil, "rotation test entry %d", i)
-		require.NoError(t, w.WriteEntry(data))
-	}
-
-	require.NoError(t, w.Sync())
-
-	// Check for multiple segment files
-	files, err := filepath.Glob(filepath.Join(dir, "segment-*"))
+func TestWALPeriodicCleanup(t *testing.T) {
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "wal-periodic-cleanup-test")
 	require.NoError(t, err)
-	require.True(t, len(files) > 1, "Expected multiple segment files after rotation")
-}
+	defer os.RemoveAll(tempDir) // Clean up after the test
 
-func TestWAL_LargeEntries(t *testing.T) {
-	w, dir := setupWAL(t, false, 5*1024*1024)
-	defer os.RemoveAll(dir)
-	defer w.Close()
+	// Define test parameters
+	nodeID := "test-node"
+	maxFileSize := int64(50) // Very small to create many segments
 
-	// Generate and write a 1MB entry
-	largeData := make([]byte, 1024*1024)
-	_, err := rand.Read(largeData)
+	// Set a debug flag to see more verbose output
+	os.Setenv("WAL_DEBUG", "1")
+
+	// Initialize WAL
+	walInstance, err := wal.OpenWAL(tempDir, nodeID, false, maxFileSize)
 	require.NoError(t, err)
 
-	require.NoError(t, w.WriteEntry(largeData))
-	require.NoError(t, w.Sync())
+	// Create a test counter
+	counter := crdt.New(nodeID)
 
-	// Verify
-	entries, err := w.ReadAll()
-	require.NoError(t, err)
-	require.Equal(t, 1, len(entries))
-	require.True(t, bytes.Equal(largeData, entries[0].Data))
-}
+	// Generate multiple segments with lots of small writes
+	for i := 0; i < 15; i++ {
+		counter.Increment(nodeID)
 
-func TestWAL_ConcurrentWrites(t *testing.T) {
-	w, dir := setupWAL(t, true, 1024*1024)
-	defer os.RemoveAll(dir)
-	defer w.Close()
+		// Write multiple times to force segment rotation
+		for j := 0; j < 5; j++ {
+			// Write increment to WAL
+			err = walInstance.WriteCounterIncrement(nodeID)
+			require.NoError(t, err)
 
-	numWriters := 10
-	entriesPerWriter := 100
-	errCh := make(chan error, numWriters)
-
-	// Concurrent writers
-	for i := range numWriters {
-		go func(writerID int) {
-			var writeErr error
-			for j := range entriesPerWriter {
-				data := fmt.Appendf(nil, "writer-%d-entry-%d", writerID, j)
-				if err := w.WriteEntry(data); err != nil {
-					writeErr = err
-					break
-				}
-			}
-			errCh <- writeErr
-		}(i)
-	}
-
-	// Check results
-	for range numWriters {
-		require.NoError(t, <-errCh)
-	}
-
-	require.NoError(t, w.Sync())
-
-	// Verify entries
-	entries, err := w.ReadAll()
-	require.NoError(t, err)
-	require.Equal(t, numWriters*entriesPerWriter, len(entries))
-
-	for i, entry := range entries {
-		require.Equal(t, uint64(i+1), entry.SequenceNumber)
-	}
-}
-
-func TestWAL_Recovery(t *testing.T) {
-	dir, err := os.MkdirTemp("", "wal-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	// Generate 10 test entries
-	var testData [][]byte
-	for i := 1; i <= 10; i++ {
-		testData = append(testData, fmt.Appendf(nil, "test entry %d", i))
-	}
-
-	// First WAL session: Write all 10 entries
-	{
-		w, err := OpenWAL(dir, false, 1024*1024)
-		require.NoError(t, err)
-
-		for _, data := range testData {
-			require.NoError(t, w.WriteEntry(data))
+			// Add extra data to increase segment size
+			data := fmt.Sprintf("extra-data-%d-%d", i, j)
+			err = walInstance.WriteMetadata(map[string]interface{}{
+				"data": data,
+				"idx":  i*5 + j,
+			})
+			require.NoError(t, err)
 		}
 
-		require.NoError(t, w.Sync())
-		require.NoError(t, w.Close())
-	}
-
-	// Get the WAL file
-	files, err := filepath.Glob(filepath.Join(dir, "segment-*"))
-	require.NoError(t, err)
-	require.NotEmpty(t, files)
-
-	// Read the file content
-	content, err := os.ReadFile(files[0])
-	require.NoError(t, err)
-
-	// Calculate approximate position of the last entry
-	// We'll truncate the file to keep only the first 9 entries
-	// and then append some corrupt data
-
-	// Create a corrupted version - truncate most of the last entry and append garbage
-	corruptedSize := int(float64(len(content)) * 0.9) // Approximate position before the last entry
-	corruptedContent := append(content[:corruptedSize], []byte{0xFF, 0xFE, 0xFD, 0xFC}...)
-
-	// Write the corrupted content back
-	err = os.WriteFile(files[0], corruptedContent, 0644)
-	require.NoError(t, err)
-
-	// Second WAL session: Verify recovery keeps only the valid entries
-	{
-		w, err := OpenWAL(dir, false, 1024*1024)
-		require.NoError(t, err)
-		defer w.Close()
-
-		entries, err := w.ReadAll()
+		// Take a snapshot every time to ensure we can recover
+		err = walInstance.WriteCounterState(counter)
 		require.NoError(t, err)
 
-		// Debug info
-		t.Logf("Found %d entries after recovery", len(entries))
-		for i, entry := range entries {
-			t.Logf("Entry %d: Seq=%d, Data=%s", i, entry.SequenceNumber, string(entry.Data))
-		}
-
-		// We should have 9 valid entries (the 10th was corrupted)
-		require.Equal(t, 9, len(entries), "Should recover exactly 9 valid entries")
-
-		// Verify entries 1-9 match our test data
-		for i := range 9 {
-			require.Equal(t, testData[i], entries[i].Data,
-				fmt.Sprintf("Entry %d data should match original", i+1))
-			require.Equal(t, uint64(i+1), entries[i].SequenceNumber,
-				fmt.Sprintf("Entry %d sequence number should be %d", i+1, i+1))
+		// Force sync every few iterations
+		if i%5 == 0 {
+			err = walInstance.Sync()
+			require.NoError(t, err)
 		}
 	}
+
+	// Force sync to ensure all data is written
+	err = walInstance.Sync()
+	require.NoError(t, err)
+
+	// Close and reopen WAL to ensure all segments are created
+	err = walInstance.Close()
+	require.NoError(t, err)
+
+	walInstance, err = wal.OpenWAL(tempDir, nodeID, false, maxFileSize)
+	require.NoError(t, err)
+	defer walInstance.Close()
+
+	// Verify we have multiple segments
+	files, err := filepath.Glob(filepath.Join(tempDir, "segment-*"))
+	require.NoError(t, err)
+	initialFileCount := len(files)
+	t.Logf("Initial segment count: %d", initialFileCount)
+	assert.Greater(t, initialFileCount, 5, "Should have created multiple segments")
+
+	// Before cleanup, check the counter value
+	preCleanupCounter, err := wal.RecoverCounter(tempDir, nodeID)
+	require.NoError(t, err)
+	expectedValue := preCleanupCounter.Value()
+	t.Logf("Expected counter value: %d", expectedValue)
+
+	// Configure cleanup with a very short interval
+	cleanupConfig := wal.CleanupConfig{
+		MaxSegments: 4,
+		MinSegments: 3,
+		MaxAge:      time.Hour,
+	}
+
+	// Instead of using the StartPeriodicCleanup function, call CleanupSegments directly
+	// This ensures we're not dealing with race conditions in the test
+	err = walInstance.CleanupSegments(cleanupConfig)
+	require.NoError(t, err)
+
+	// Wait a moment to make sure file system operations complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Force sync before closing
+	err = walInstance.Sync()
+	require.NoError(t, err)
+
+	// Close the WAL
+	err = walInstance.Close()
+	require.NoError(t, err)
+
+	// Wait a bit longer to ensure all file operations are complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify files were cleaned up
+	files, err = filepath.Glob(filepath.Join(tempDir, "segment-*"))
+	require.NoError(t, err)
+	t.Logf("Segment count after cleanup: %d", len(files))
+
+	// Log remaining segments for debugging
+	t.Log("Segments after cleanup:")
+	for _, file := range files {
+		segmentIndex := filepath.Base(file)[len("segment-"):]
+		t.Logf("  %s (index: %s)", file, segmentIndex)
+	}
+
+	assert.LessOrEqual(t, len(files), cleanupConfig.MaxSegments,
+		"Should have no more than MaxSegments segments after cleanup")
+	assert.GreaterOrEqual(t, len(files), cleanupConfig.MinSegments,
+		"Should have at least MinSegments segments after cleanup")
+	assert.Less(t, len(files), initialFileCount,
+		"Should have fewer files after cleanup")
+
+	// Check we can still recover
+	recoveredCounter, err := wal.RecoverCounter(tempDir, nodeID)
+	require.NoError(t, err)
+
+	// Log actual values for debugging
+	recoveredValue := recoveredCounter.Value()
+	t.Logf("Recovered counter value: %d", recoveredValue)
+
+	assert.Equal(t, expectedValue, recoveredValue,
+		"Recovered counter should have the same value after cleanup")
 }

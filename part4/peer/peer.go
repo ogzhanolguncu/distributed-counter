@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part4/assertions"
 )
 
 type Peer struct {

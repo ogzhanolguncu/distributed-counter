@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/discovery"
-	"github.com/ogzhanolguncu/distributed-counter/part3/node"
-	"github.com/ogzhanolguncu/distributed-counter/part3/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part3/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part4/discovery"
+	"github.com/ogzhanolguncu/distributed-counter/part4/node"
+	"github.com/ogzhanolguncu/distributed-counter/part4/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part4/protocol"
 )
 
 const (
@@ -24,8 +24,11 @@ const (
 	defaultMaxConsecutiveFails = 5
 	defaultFailureTimeout      = 30 * time.Second
 	defaultDiscoveryAddr       = "localhost:8000"
-	defaultWalBaseDir          = "data/wal"
-	defaultMaxWalFileSize      = 64 * 1024 * 1024 // 64MB
+	defaultDataDir             = "data"
+	defaultWALCleanupInterval  = 1 * time.Hour
+	defaultWALMaxSegments      = 50
+	defaultWALMinSegments      = 5
+	defaultWALMaxAge           = 7 * 24 * time.Hour // 7 days
 )
 
 func main() {
@@ -39,28 +42,19 @@ func main() {
 	failureTimeout := flag.Duration("failure-timeout", defaultFailureTimeout, "Timeout before marking peer as inactive")
 
 	// WAL options
-	enableWal := flag.Bool("wal", true, "Enable Write-Ahead Log")
-	enableWalFsync := flag.Bool("wal-fsync", true, "Enable immediate fsync for WAL")
-	walDir := flag.String("wal-dir", "", "WAL directory (defaults to data/wal/<node-addr>)")
-	maxWalFileSize := flag.Int64("wal-max-size", defaultMaxWalFileSize, "Maximum WAL file size before rotation")
+	dataDir := flag.String("data-dir", defaultDataDir, "Base directory for data storage")
+	snapshotInterval := flag.Duration("snapshot-interval", 5*time.Minute, "How often to take a full snapshot of counter state")
+
+	// WAL cleanup options
+	walCleanupInterval := flag.Duration("wal-cleanup-interval", defaultWALCleanupInterval, "How often to run WAL segment cleanup")
+	walMaxSegments := flag.Int("wal-max-segments", defaultWALMaxSegments, "Maximum number of WAL segments to keep")
+	walMinSegments := flag.Int("wal-min-segments", defaultWALMinSegments, "Minimum number of WAL segments to always keep")
+	walMaxAge := flag.Duration("wal-max-age", defaultWALMaxAge, "Maximum age of WAL segments to keep")
 
 	// HTTP server options
 	httpPort := flag.Int("http-port", 0, "HTTP server port (defaults to 8010 + (TCP port - 9000))")
 
 	flag.Parse()
-
-	// If WAL directory not specified, use default
-	nodeWalDir := *walDir
-	if nodeWalDir == "" && *enableWal {
-		// Convert addr to a valid directory name
-		dirName := *addr
-		if dirName == "localhost:9000" {
-			dirName = "node-default"
-		} else {
-			dirName = "node-" + filepath.Base(dirName)
-		}
-		nodeWalDir = filepath.Join(defaultWalBaseDir, dirName)
-	}
 
 	// Create transport
 	transport, err := protocol.NewTCPTransport(*addr)
@@ -71,17 +65,21 @@ func main() {
 	// Create peer manager
 	peerManager := peer.NewPeerManager(*maxConsecutiveFails, *failureTimeout)
 
-	// Create node
+	// Create node configuration
 	config := node.Config{
 		Addr:                *addr,
 		SyncInterval:        *syncInterval,
+		FullSyncInterval:    *syncInterval * 10, // Default to 10x regular sync interval
 		MaxSyncPeers:        *maxSyncPeers,
 		MaxConsecutiveFails: *maxConsecutiveFails,
 		FailureTimeout:      *failureTimeout,
-		WalDir:              nodeWalDir,
-		EnableWal:           *enableWal,
-		EnableWalFsync:      *enableWalFsync,
-		MaxWalFileSize:      *maxWalFileSize,
+		DataDir:             *dataDir,
+		SnapshotInterval:    *snapshotInterval,
+		// WAL cleanup settings
+		WALCleanupInterval: *walCleanupInterval,
+		WALMaxSegments:     *walMaxSegments,
+		WALMinSegments:     *walMinSegments,
+		WALMaxAge:          *walMaxAge,
 	}
 
 	n, err := node.NewNode(config, transport, peerManager)
@@ -96,9 +94,9 @@ func main() {
 	}
 
 	log.Printf("Node started at %s and registered with discovery server at %s", *addr, *discoveryAddr)
-	if *enableWal {
-		log.Printf("WAL enabled at directory: %s", nodeWalDir)
-	}
+	log.Printf("WAL enabled with storage directory: %s", filepath.Join(*dataDir, "wal", *addr))
+	log.Printf("WAL cleanup configuration: max segments=%d, min segments=%d, cleanup interval=%v",
+		*walMaxSegments, *walMinSegments, *walCleanupInterval)
 
 	// Setup HTTP handlers for interaction
 	setupHTTPHandlers(n, *httpPort)
@@ -120,16 +118,20 @@ func main() {
 func setupHTTPHandlers(n *node.Node, configuredHttpPort int) {
 	http.HandleFunc("/increment", func(w http.ResponseWriter, r *http.Request) {
 		n.Increment()
-		fmt.Fprintf(w, "Counter incremented to %d (version %d)\n", n.GetCounter(), n.GetVersion())
+		fmt.Fprintf(w, "Counter incremented to %d\n", n.GetCounter())
 	})
 
 	http.HandleFunc("/decrement", func(w http.ResponseWriter, r *http.Request) {
 		n.Decrement()
-		fmt.Fprintf(w, "Counter decremented to %d (version %d)\n", n.GetCounter(), n.GetVersion())
+		fmt.Fprintf(w, "Counter decremented to %d\n", n.GetCounter())
 	})
 
 	http.HandleFunc("/counter", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Counter: %d (version %d)\n", n.GetCounter(), n.GetVersion())
+		fmt.Fprintf(w, "Counter: %d\n", n.GetCounter())
+	})
+
+	http.HandleFunc("/local-counter", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Local Counter: %d\n", n.GetLocalCounter())
 	})
 
 	http.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {

@@ -2,63 +2,47 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"slices"
-	"sync/atomic"
+	"sort"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/assertions"
-	"github.com/ogzhanolguncu/distributed-counter/part3/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part3/protocol"
-	"github.com/ogzhanolguncu/distributed-counter/part3/wal"
+	"github.com/cespare/xxhash/v2"
+	"github.com/ogzhanolguncu/distributed-counter/part4/assertions"
+	"github.com/ogzhanolguncu/distributed-counter/part4/crdt"
+	"github.com/ogzhanolguncu/distributed-counter/part4/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part4/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part4/wal"
+	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
-	defaultChannelBuffer = 100
-	defaultMaxFileSize   = 64 * 1024 * 1024 // 64MB
-	defaultWalDir        = "wal"
+	defaultChannelBuffer = 10_000
+	defaultMaxWALSize    = 64 * 1024 * 1024 // 64MB
+	walDirName           = "wal"
 )
-
-type OperationType string
-
-const (
-	OpIncrement OperationType = "increment"
-	OpDecrement OperationType = "decrement"
-	OpUpdate    OperationType = "update"
-)
-
-type NodeState struct {
-	Counter uint64 `json:"counter"`
-	Version uint32 `json:"version"`
-}
-
-type WalEntry struct {
-	Operation OperationType `json:"operation"`
-	Counter   uint64        `json:"counter"`
-	Version   uint32        `json:"version"`
-	Timestamp int64         `json:"timestamp"`
-}
-
-type State struct {
-	counter atomic.Uint64
-	version atomic.Uint32
-}
 
 type Config struct {
 	Addr                string
 	SyncInterval        time.Duration
+	FullSyncInterval    time.Duration
 	MaxSyncPeers        int
 	MaxConsecutiveFails int
 	FailureTimeout      time.Duration
-	WalDir              string
-	EnableWal           bool
-	EnableWalFsync      bool
-	MaxWalFileSize      int64
+	DataDir             string        // Directory to store WAL files
+	SnapshotInterval    time.Duration // How often to take a full snapshot of counter state
+	LogLevel            slog.Level
+
+	// WAL cleanup settings
+	WALCleanupInterval time.Duration
+	WALMaxSegments     int
+	WALMinSegments     int
+	WALMaxAge          time.Duration
 }
 
 type MessageInfo struct {
@@ -67,8 +51,9 @@ type MessageInfo struct {
 }
 
 type Node struct {
-	config Config
-	state  *State
+	config  Config
+	counter *crdt.PNCounter
+	logger  *slog.Logger
 
 	peers *peer.PeerManager
 
@@ -76,62 +61,131 @@ type Node struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	incomingMsg chan MessageInfo
-	outgoingMsg chan MessageInfo
-	syncTick    <-chan time.Time
-
-	wal *wal.WAL
+	incomingMsg  chan MessageInfo
+	outgoingMsg  chan MessageInfo
+	syncTick     <-chan time.Time
+	fullSyncTick <-chan time.Time
+	snapshotTick <-chan time.Time
+	wal          *wal.WAL
 }
 
 func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
-	assertions.Assert(config.FailureTimeout > 0, "failure timeout must be positive")
-	assertions.Assert(config.MaxConsecutiveFails > 0, "max consecutive fails must be positive")
 	assertions.Assert(config.MaxSyncPeers > 0, "max sync peers must be positive")
 	assertions.Assert(config.Addr != "", "node address cannot be empty")
+	assertions.Assert(config.MaxConsecutiveFails > 0, "max consecutive fails must be positive")
+	assertions.Assert(config.FailureTimeout > 0, "failure timeout must be positive")
 	assertions.AssertNotNil(transport, "transport cannot be nil")
 	assertions.AssertNotNil(peerManager, "peer manager cannot be nil")
 
-	if config.WalDir == "" && config.EnableWal {
-		config.WalDir = filepath.Join(defaultWalDir, config.Addr)
+	// Set default values for fields not specified
+	if config.FullSyncInterval == 0 {
+		config.FullSyncInterval = config.SyncInterval * 10 // Default to 10x regular sync interval
 	}
 
-	if config.MaxWalFileSize <= 0 && config.EnableWal {
-		config.MaxWalFileSize = defaultMaxFileSize
+	if config.SnapshotInterval == 0 {
+		config.SnapshotInterval = 5 * time.Minute // Default snapshot interval
+	}
+
+	if config.DataDir == "" {
+		config.DataDir = "data" // Default data directory
+	}
+
+	// Set defaults for WAL cleanup config
+	if config.WALCleanupInterval == 0 {
+		config.WALCleanupInterval = 1 * time.Hour // Check for cleanup once per hour
+	}
+	if config.WALMaxSegments == 0 {
+		config.WALMaxSegments = 50 // Keep at most 50 segments
+	}
+	if config.WALMinSegments == 0 {
+		config.WALMinSegments = 5 // Always keep at least 5 segments
+	}
+	if config.WALMaxAge == 0 {
+		config.WALMaxAge = 7 * 24 * time.Hour // Keep segments up to 7 days old
+	}
+
+	// Configure logger
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: config.LogLevel,
+	})).With("[NODE]", config.Addr)
+
+	// Create data directory if it doesn't exist
+	walPath := filepath.Join(config.DataDir, walDirName, config.Addr)
+	if err := os.MkdirAll(walPath, 0755); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	// Initialize the WAL
+	nodeWAL, err := wal.OpenWAL(walPath, config.Addr, true, defaultMaxWALSize)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+
+	// Recover counter state from WAL or initialize new counter
+	counter, err := wal.RecoverCounter(walPath, config.Addr)
+	if err != nil {
+		logger.Warn("failed to recover counter from WAL, initializing new counter",
+			"error", err)
+		counter = crdt.New(config.Addr)
 	}
 
 	node := &Node{
 		config:    config,
-		state:     &State{},
+		counter:   counter,
 		peers:     peerManager,
+		logger:    logger,
 		ctx:       ctx,
 		cancel:    cancel,
 		transport: transport,
+		wal:       nodeWAL,
 
-		incomingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		outgoingMsg: make(chan MessageInfo, defaultChannelBuffer),
-		syncTick:    time.NewTicker(config.SyncInterval).C,
+		incomingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		outgoingMsg:  make(chan MessageInfo, defaultChannelBuffer),
+		syncTick:     time.NewTicker(config.SyncInterval).C,
+		fullSyncTick: time.NewTicker(config.FullSyncInterval).C,
+		snapshotTick: time.NewTicker(config.SnapshotInterval).C,
 	}
 
-	assertions.AssertNotNil(node.state, "node state must be initialized")
+	assertions.AssertNotNil(node.counter, "node counter must be initialized")
 	assertions.AssertNotNil(node.ctx, "node context must be initialized")
 	assertions.AssertNotNil(node.cancel, "node cancel function must be initialized")
+	assertions.AssertNotNil(node.wal, "node WAL must be initialized")
 
-	// Setup WAL if enabled
-	if config.EnableWal {
-		if err := node.setupWAL(); err != nil {
-			cancel()
-			return nil, fmt.Errorf("failed to setup WAL: %w", err)
-		}
+	// Record initial metadata
+	initialMetadata := map[string]interface{}{
+		"node_id":      config.Addr,
+		"startup_time": time.Now().UnixNano(),
+		"version":      "1.0.0",
 	}
+	if err := nodeWAL.WriteMetadata(initialMetadata); err != nil {
+		logger.Warn("failed to write initial metadata to WAL", "error", err)
+	}
+
+	// Create initial snapshot of counter state
+	if err := nodeWAL.WriteCounterState(counter); err != nil {
+		logger.Warn("failed to write initial counter state to WAL", "error", err)
+	}
+
+	// Start periodic cleanup of old WAL segments
+	cleanupConfig := wal.CleanupConfig{
+		MaxSegments: config.WALMaxSegments,
+		MinSegments: config.WALMinSegments,
+		MaxAge:      config.WALMaxAge,
+	}
+	nodeWAL.StartPeriodicCleanup(config.WALCleanupInterval, cleanupConfig)
+	logger.Info("started WAL segment cleanup",
+		"interval", config.WALCleanupInterval,
+		"max_segments", config.WALMaxSegments,
+		"min_segments", config.WALMinSegments,
+		"max_age", config.WALMaxAge)
 
 	if err := node.startTransport(); err != nil {
 		cancel() // Clean up if we fail to start
-		if node.wal != nil {
-			node.wal.Close()
-		}
 		return nil, err
 	}
 
@@ -139,112 +193,6 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 	go node.pruneStaleNodes()
 
 	return node, nil
-}
-
-func (n *Node) setupWAL() error {
-	walInstance, err := wal.OpenWAL(n.config.WalDir, n.config.EnableWalFsync, n.config.MaxWalFileSize)
-	if err != nil {
-		return fmt.Errorf("failed to initialize WAL: %w", err)
-	}
-	n.wal = walInstance
-
-	if err := n.restoreFromWAL(); err != nil {
-		log.Printf("[Node %s] Warning: Failed to restore from WAL: %v", n.config.Addr, err)
-	}
-
-	return nil
-}
-
-func (n *Node) restoreFromWAL() error {
-	if n.wal == nil {
-		return fmt.Errorf("WAL not initialized")
-	}
-
-	entries, err := n.wal.ReadAll()
-	if err != nil {
-		return fmt.Errorf("failed to read from WAL: %w", err)
-	}
-
-	if len(entries) == 0 {
-		log.Printf("[Node %s] No entries in WAL to restore", n.config.Addr)
-		return nil
-	}
-
-	// Replay the WAL entries to reconstruct state
-	var highestVersion uint32 = 0
-	var finalCounter uint64 = 0
-	var lastAppliedSeq uint64 = 0
-
-	// First pass: find the highest sequence we've seen
-	for _, entry := range entries {
-		if entry.SequenceNumber > lastAppliedSeq {
-			lastAppliedSeq = entry.SequenceNumber
-		}
-	}
-
-	// Second pass: apply operations in order
-	for _, entry := range entries {
-		var walEntry WalEntry
-		if err := json.Unmarshal(entry.Data, &walEntry); err != nil {
-			// Try the old format for backward compatibility
-			var oldState NodeState
-			if err := json.Unmarshal(entry.Data, &oldState); err != nil {
-				log.Printf("[Node %s] Warning: Failed to decode WAL entry: %v", n.config.Addr, err)
-				continue
-			}
-
-			// Use the highest version state from old format
-			if oldState.Version > highestVersion {
-				highestVersion = oldState.Version
-				finalCounter = oldState.Counter
-			}
-			continue
-		}
-
-		switch walEntry.Operation {
-		case OpIncrement:
-			finalCounter++
-			highestVersion = walEntry.Version
-		case OpDecrement:
-			finalCounter--
-			highestVersion = walEntry.Version
-		case OpUpdate:
-			finalCounter = walEntry.Counter
-			highestVersion = walEntry.Version
-		}
-	}
-
-	n.state.version.Store(highestVersion)
-	n.state.counter.Store(finalCounter)
-
-	log.Printf("[Node %s] Restored from WAL: version=%d, counter=%d",
-		n.config.Addr, highestVersion, finalCounter)
-
-	return nil
-}
-
-func (n *Node) logOperation(opType OperationType, counter uint64, version uint32) error {
-	if n.wal == nil {
-		return nil // WAL not enabled, silently succeed
-	}
-
-	walEntry := WalEntry{
-		Operation: opType,
-		Counter:   counter,
-		Version:   version,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	data, err := json.Marshal(walEntry)
-	if err != nil {
-		return fmt.Errorf("failed to encode operation: %w", err)
-	}
-
-	if err := n.wal.WriteEntry(data); err != nil {
-		return fmt.Errorf("failed to write to WAL: %w", err)
-	}
-
-	return nil
 }
 
 func (n *Node) pruneStaleNodes() {
@@ -264,26 +212,29 @@ func (n *Node) pruneStaleNodes() {
 func (n *Node) startTransport() error {
 	err := n.transport.Listen(func(addr string, data []byte) error {
 		assertions.Assert(addr != "", "incoming addr cannot be empty")
-		assertions.AssertNotNil(data, "incoming data cannot be nil")
+		assertions.AssertNotNil(data, "incoming data cannot be nil or empty")
 
-		msg, err := protocol.DecodeMessage(data)
+		msg, err := protocol.Decode(data)
 		if err != nil {
-			return fmt.Errorf("[Node %s]: StartTransport failed to read %w", n.config.Addr, err)
+			n.logger.Error("failed to decode incoming message",
+				"node", n.config.Addr,
+				"from", addr,
+				"error", err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
-
-		assertions.AssertNotNil(msg, "decoded message cannot be nil")
-		assertions.Assert(msg.Type == protocol.MessageTypePull || msg.Type == protocol.MessageTypePush,
-			"invalid message type")
-
 		select {
 		case n.incomingMsg <- MessageInfo{message: *msg, addr: addr}:
+			// Message queued successfully
 		default:
-			log.Printf("[Node %s]: Dropping message. Channel is full", addr)
+			n.logger.Warn("dropping incoming message, channel is full",
+				"node", n.config.Addr,
+				"from", addr,
+				"message_type", msg.Type)
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("[Node %s]: Failed to start transport listener: %w", n.config.Addr, err)
+		return fmt.Errorf("failed to start transport listener: %w", err)
 	}
 
 	return nil
@@ -293,102 +244,156 @@ func (n *Node) eventLoop() {
 	for {
 		select {
 		case <-n.ctx.Done():
-			log.Printf("[Node %s] Shutting down with version=%d and counter=%d",
-				n.config.Addr, n.state.version.Load(), n.state.counter.Load())
+			n.logCounterState("node shutting down")
 			return
 
 		case msg := <-n.incomingMsg:
-			assertions.Assert(msg.addr != "", "incoming message addr cannot be empty")
 			n.handleIncMsg(msg)
 
 		case msg := <-n.outgoingMsg:
 			assertions.Assert(msg.addr != "", "outgoing addr cannot be empty")
-			assertions.Assert(msg.message.Type == protocol.MessageTypePull ||
-				msg.message.Type == protocol.MessageTypePush, "invalid message type")
+			data, err := protocol.Encode(msg.message)
+			if err != nil {
+				n.logger.Error("failed to encode outgoing message",
+					"node", n.config.Addr,
+					"target", msg.addr,
+					"message_type", msg.message.Type,
+					"error", err)
+				continue
+			}
 
-			encodedMsg := msg.message.Encode()
-			assertions.AssertEqual(protocol.MessageSize, len(encodedMsg),
-				fmt.Sprintf("encoded message must be exactly %d bytes", protocol.MessageSize))
-
-			if err := n.transport.Send(msg.addr, encodedMsg); err != nil {
-				log.Printf("[Node %s] Failed to send message to %s: %v",
-					n.config.Addr, msg.addr, err)
+			if err := n.transport.Send(msg.addr, data); err != nil {
+				n.logger.Error("failed to send message",
+					"node", n.config.Addr,
+					"target", msg.addr,
+					"message_type", msg.message.Type,
+					"error", err)
 
 				if n.peers.MarkPeerFailed(msg.addr) {
-					log.Printf("[Node %s] Peer %s is now considered inactive after %d consecutive failures",
-						n.config.Addr, msg.addr, n.config.MaxConsecutiveFails)
+					n.logger.Warn("peer is now inactive after consecutive failures",
+						"peer", msg.addr,
+						"max_fails", n.config.MaxConsecutiveFails)
 				}
-
 			} else {
 				n.peers.MarkPeerActive(msg.addr)
 			}
 
 		case <-n.syncTick:
-			n.pullState()
+			n.initiateDigestSync()
+
+		case <-n.fullSyncTick:
+			n.performFullStateSync()
+
+		case <-n.snapshotTick:
+			// Periodically snapshot the full counter state to optimize recovery
+			if err := n.wal.WriteCounterState(n.counter); err != nil {
+				n.logger.Error("failed to write counter snapshot to WAL",
+					"node", n.config.Addr,
+					"error", err)
+			} else {
+				n.logger.Info("wrote counter snapshot to WAL",
+					"node", n.config.Addr,
+					"counter_value", n.counter.Value())
+			}
 		}
 	}
 }
 
-func (n *Node) broadcastUpdate() {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
-
-	ctx, cancel := context.WithTimeout(n.ctx, n.config.SyncInterval/2)
-	defer cancel()
-
-	g, ctx := errgroup.WithContext(ctx)
-
+func (n *Node) performFullStateSync() {
 	peers := n.peers.GetPeers()
-	for _, peerAddr := range peers {
-		assertions.Assert(peerAddr != "", "peer address cannot be empty")
-
-		peerAddr := peerAddr // Shadow the variable for goroutine
-		g.Go(func() error {
-			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
-
-			select {
-			case n.outgoingMsg <- MessageInfo{
-				message: protocol.Message{
-					Type:    protocol.MessageTypePush,
-					Version: n.state.version.Load(),
-					Counter: n.state.counter.Load(),
-				},
-				addr: peerAddr,
-			}:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
+	if len(peers) == 0 {
+		n.logger.Info("skipping full state sync - no peers available", "node", n.config.Addr)
+		return
 	}
 
-	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+	// Select a subset of random peers for full state sync
+	numPeers := max(1, min(n.config.MaxSyncPeers/2, len(peers)))
+	selectedPeers := make([]string, len(peers))
+	copy(selectedPeers, peers)
+	rand.Shuffle(len(selectedPeers), func(i, j int) {
+		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
+	})
+
+	// Prepare full state message
+	message := n.prepareCounterMessage(protocol.MessageTypePush)
+
+	n.logCounterState("performing full state sync (anti-entropy)",
+		"peers_count", numPeers,
+		"selected_peers", selectedPeers[:numPeers])
+
+	// Send to selected peers
+	for _, peer := range selectedPeers[:numPeers] {
+		n.outgoingMsg <- MessageInfo{
+			message: message,
+			addr:    peer,
+		}
+	}
+
+	// After full sync, consider taking a snapshot of counter state
+	if err := n.wal.WriteCounterState(n.counter); err != nil {
+		n.logger.Error("failed to write counter snapshot after full sync",
+			"node", n.config.Addr,
+			"error", err)
 	}
 }
 
-func (n *Node) pullState() {
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
+// Create a message with the current counter state
+func (n *Node) prepareCounterMessage(msgType uint8) protocol.Message {
+	// Get both increment and decrement counters
+	increments, decrements := n.counter.Counters()
+	return protocol.Message{
+		Type:            msgType,
+		NodeID:          n.config.Addr,
+		IncrementValues: increments,
+		DecrementValues: decrements,
+	}
+}
 
+func (n *Node) prepareDigestMessage(msgType uint8, digestValue ...uint64) protocol.Message {
+	// Base message with common fields
+	msg := protocol.Message{
+		Type:   msgType,
+		NodeID: n.config.Addr,
+	}
+
+	// If it's a digest pull or digest ack, set the digest
+	if msgType == protocol.MessageTypeDigestPull || msgType == protocol.MessageTypeDigestAck {
+		// For digest pull, calculate our current digest
+		if msgType == protocol.MessageTypeDigestPull || len(digestValue) == 0 {
+			// Get both increment and decrement counters
+			increments, decrements := n.counter.Counters()
+			data, err := deterministicSerialize(increments, decrements)
+			if err != nil {
+				n.logger.Error("failed to create digest message",
+					"node", n.config.Addr,
+					"message_type", msgType,
+					"error", err)
+				return msg
+			}
+
+			msg.Digest = xxhash.Sum64(data)
+		} else {
+			// For digest ack, use the provided digest value
+			msg.Digest = digestValue[0]
+		}
+	}
+
+	return msg
+}
+
+func (n *Node) initiateDigestSync() {
 	peers := n.peers.GetPeers()
 
 	if len(peers) == 0 {
-		log.Printf("[Node %s] No peers available for sync", n.config.Addr)
+		n.logger.Info("skipping digest sync - no peers available", "node", n.config.Addr)
 		return
 	}
 
 	numPeers := min(n.config.MaxSyncPeers, len(peers))
 	assertions.Assert(numPeers > 0, "number of peers to sync with must be positive")
 
-	selectedPeers := make([]string, 0, len(peers))
-	for _, peer := range peers {
-		assertions.Assert(peer != "", "peer address cannot be empty")
-		selectedPeers = append(selectedPeers, peer)
-	}
-
-	assertions.AssertEqual(len(selectedPeers), len(peers), "all peers must be selected initially")
-
+	selectedPeers := make([]string, len(peers))
+	copy(selectedPeers, peers)
 	rand.Shuffle(len(selectedPeers), func(i, j int) {
 		selectedPeers[i], selectedPeers[j] = selectedPeers[j], selectedPeers[i]
 	})
@@ -398,20 +403,24 @@ func (n *Node) pullState() {
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	message := n.prepareDigestMessage(protocol.MessageTypeDigestPull)
+
+	n.logCounterState("initiating digest sync",
+		"selected_peers", selectedPeers[:numPeers],
+		"digest", message.Digest)
+
 	for _, peer := range selectedPeers[:numPeers] {
 		peerAddr := peer // Shadow the variable for goroutine
 		g.Go(func() error {
-			log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-				n.config.Addr, peerAddr, protocol.MessageTypePull, n.state.version.Load(), n.state.counter.Load())
+			n.logger.Info("sending digest pull",
+				"node", n.config.Addr,
+				"target", peerAddr,
+				"digest", message.Digest)
 
 			select {
 			case n.outgoingMsg <- MessageInfo{
-				message: protocol.Message{
-					Type:    protocol.MessageTypePull,
-					Version: n.state.version.Load(),
-					Counter: n.state.counter.Load(),
-				},
-				addr: peerAddr,
+				message: message,
+				addr:    peerAddr,
 			}:
 				return nil
 			case <-ctx.Done():
@@ -421,19 +430,26 @@ func (n *Node) pullState() {
 	}
 
 	if err := g.Wait(); err != nil {
-		log.Printf("[Node %s] Sync round failed: %v", n.config.Addr, err)
+		n.logger.Error("sync round failed",
+			"node", n.config.Addr,
+			"error", err)
 	}
 }
 
 func (n *Node) handleIncMsg(inc MessageInfo) {
-	assertions.Assert(inc.addr != "", "incoming message address cannot be empty")
-	assertions.Assert(inc.message.Type == protocol.MessageTypePull ||
-		inc.message.Type == protocol.MessageTypePush, "invalid message type")
+	assertions.Assert(
+		inc.message.Type == protocol.MessageTypePush ||
+			inc.message.Type == protocol.MessageTypeDigestAck ||
+			inc.message.Type == protocol.MessageTypeDigestPull,
+		"invalid message type")
 
-	log.Printf("[Node %s] Received message from %s type=%d, version=%d, counter=%d",
-		n.config.Addr, inc.addr, inc.message.Type, inc.message.Version, inc.message.Counter)
+	n.logger.Info("received message",
+		"node", n.config.Addr,
+		"from", inc.addr,
+		"message_type", inc.message.Type,
+		"remote_node_id", inc.message.NodeID)
 
-	// Add new peers that were not previously known
+	// This is required for nodes that joined after that missed initial discovery
 	if !slices.Contains(n.peers.GetPeers(), inc.addr) {
 		n.peers.AddPeer(inc.addr)
 	} else {
@@ -441,103 +457,149 @@ func (n *Node) handleIncMsg(inc MessageInfo) {
 	}
 
 	switch inc.message.Type {
-	case protocol.MessageTypePull:
-		if inc.message.Version > n.state.version.Load() {
-			if err := n.logOperation(OpUpdate, inc.message.Counter, inc.message.Version); err != nil {
-				log.Printf("[Node %s] Failed to log update operation to WAL: %v", n.config.Addr, err)
-				// Continue with the operation anyway as we already have the data from peer
+	case protocol.MessageTypeDigestPull:
+		// Create our counters hash
+		increments, decrements := n.counter.Counters()
+		data, err := deterministicSerialize(increments, decrements)
+		if err != nil {
+			n.logger.Error("failed to serialize counters",
+				"node", n.config.Addr,
+				"counter_value", n.counter.Value(),
+				"error", err)
+			return
+		}
+
+		countersHash := xxhash.Sum64(data)
+
+		if countersHash == inc.message.Digest {
+			// Digests match - send ack with matching digest
+			ackMsg := n.prepareDigestMessage(protocol.MessageTypeDigestAck, inc.message.Digest)
+
+			n.logger.Info("sending digest acknowledgment (digests match)",
+				"node", n.config.Addr,
+				"target", inc.addr,
+				"digest", countersHash,
+				"counter_value", n.counter.Value())
+
+			n.outgoingMsg <- MessageInfo{
+				addr:    inc.addr,
+				message: ackMsg,
 			}
+		} else {
+			// Digests don't match - send full state
+			responseMsg := n.prepareCounterMessage(protocol.MessageTypePush)
 
-			oldVersion := n.state.version.Load()
-			n.state.version.Store(inc.message.Version)
-			n.state.counter.Store(inc.message.Counter)
-			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
+			n.logger.Info("sending full state (digests don't match)",
+				"node", n.config.Addr,
+				"target", inc.addr,
+				"local_digest", countersHash,
+				"remote_digest", inc.message.Digest,
+				"counter_value", n.counter.Value())
 
-			n.broadcastUpdate()
+			n.outgoingMsg <- MessageInfo{
+				message: responseMsg,
+				addr:    inc.addr,
+			}
 		}
-
-		log.Printf("[Node %s] Sent message to %s type=%d, version=%d, counter=%d",
-			n.config.Addr, inc.addr, protocol.MessageTypePush, n.state.version.Load(), n.state.counter.Load())
-
-		n.outgoingMsg <- MessageInfo{
-			message: protocol.Message{
-				Type:    protocol.MessageTypePush,
-				Version: n.state.version.Load(),
-				Counter: n.state.counter.Load(),
-			},
-			addr: inc.addr,
-		}
+	case protocol.MessageTypeDigestAck:
+		n.logger.Info("received digest acknowledgment",
+			"node", n.config.Addr,
+			"from", inc.addr,
+			"digest", inc.message.Digest,
+			"counter_value", n.counter.Value())
+		return
 
 	case protocol.MessageTypePush:
-		if inc.message.Version > n.state.version.Load() {
-			if err := n.logOperation(OpUpdate, inc.message.Counter, inc.message.Version); err != nil {
-				log.Printf("[Node %s] Failed to log update operation to WAL: %v", n.config.Addr, err)
-				// Continue with the operation anyway as we already have the data from peer
+		oldValue := n.counter.Value()
+
+		// For push messages, create a counter and merge it
+		tempCounter := crdt.New(inc.message.NodeID)
+		tempCounter.MergeIncrements(inc.message.IncrementValues)
+		tempCounter.MergeDecrements(inc.message.DecrementValues)
+
+		// Merge with our local counter
+		updated := n.counter.Merge(tempCounter)
+
+		if updated {
+			newValue := n.counter.Value()
+			increments, decrements := n.counter.Counters()
+			n.logger.Info("counter updated after merge",
+				"node", n.config.Addr,
+				"from", oldValue,
+				"to", newValue,
+				"increments", increments,
+				"decrements", decrements,
+				"from_node", inc.message.NodeID)
+
+			// Write counter state to WAL after successful merge
+			if err := n.wal.WriteCounterState(n.counter); err != nil {
+				n.logger.Error("failed to write counter state to WAL after merge",
+					"node", n.config.Addr,
+					"error", err)
 			}
-
-			oldVersion := n.state.version.Load()
-			n.state.version.Store(inc.message.Version)
-			n.state.counter.Store(inc.message.Counter)
-			assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after update")
-
-			n.broadcastUpdate()
+		} else {
+			n.logger.Info("received push message (no changes)",
+				"node", n.config.Addr,
+				"from", inc.addr,
+				"counter_value", n.counter.Value())
 		}
 	}
-}
-
-func (n *Node) GetPeerManager() *peer.PeerManager {
-	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
-	return n.peers
 }
 
 func (n *Node) Increment() {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	oldCounter := n.state.counter.Load()
-	oldVersion := n.state.version.Load()
-	newVersion := oldVersion + 1
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
-	if err := n.logOperation(OpIncrement, oldCounter+1, newVersion); err != nil {
-		log.Printf("[Node %s] Failed to log increment operation to WAL: %v", n.config.Addr, err)
-		return
+	oldValue := n.counter.Value()
+	newValue := n.counter.Increment(n.config.Addr)
+
+	increments, decrements := n.counter.Counters()
+
+	n.logger.Info("incremented counter",
+		"node", n.config.Addr,
+		"from", oldValue,
+		"to", newValue,
+		"increments", increments,
+		"decrements", decrements)
+
+	// Log increment operation to WAL
+	if err := n.wal.WriteCounterIncrement(n.config.Addr); err != nil {
+		n.logger.Error("failed to write increment to WAL",
+			"node", n.config.Addr,
+			"error", err)
 	}
-
-	n.state.counter.Add(1)
-	n.state.version.Add(1)
-
-	assertions.Assert(n.state.counter.Load() > oldCounter, "counter must increase after Increment")
-	assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after Increment")
-
-	n.broadcastUpdate()
 }
 
 func (n *Node) Decrement() {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	oldCounter := n.state.counter.Load()
-	oldVersion := n.state.version.Load()
-	newVersion := oldVersion + 1
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
-	if err := n.logOperation(OpDecrement, oldCounter-1, newVersion); err != nil {
-		log.Printf("[Node %s] Failed to log decrement operation to WAL: %v", n.config.Addr, err)
-		return
+	oldValue := n.counter.Value()
+	newValue := n.counter.Decrement(n.config.Addr)
+
+	increments, decrements := n.counter.Counters()
+
+	n.logger.Info("decremented counter",
+		"node", n.config.Addr,
+		"from", oldValue,
+		"to", newValue,
+		"increments", increments,
+		"decrements", decrements)
+
+	// Log decrement operation to WAL
+	if err := n.wal.WriteCounterDecrement(n.config.Addr); err != nil {
+		n.logger.Error("failed to write decrement to WAL",
+			"node", n.config.Addr,
+			"error", err)
 	}
-
-	n.state.counter.Add(^uint64(0)) // Subtract 1
-	n.state.version.Add(1)
-
-	assertions.Assert(n.state.counter.Load() < oldCounter, "counter must decrease after Decrement")
-	assertions.Assert(n.state.version.Load() > oldVersion, "version must increase after Decrement")
-
-	n.broadcastUpdate()
 }
 
-func (n *Node) GetCounter() uint64 {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.counter.Load()
+func (n *Node) GetCounter() int64 {
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
+	return n.counter.Value()
 }
 
-func (n *Node) GetVersion() uint32 {
-	assertions.AssertNotNil(n.state, "node state cannot be nil")
-	return n.state.version.Load()
+func (n *Node) GetLocalCounter() int64 {
+	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
+	return n.counter.LocalValue(n.config.Addr)
 }
 
 func (n *Node) GetAddr() string {
@@ -548,14 +610,90 @@ func (n *Node) GetAddr() string {
 func (n *Node) Close() error {
 	assertions.AssertNotNil(n.cancel, "cancel function cannot be nil")
 	assertions.AssertNotNil(n.transport, "transport cannot be nil")
+	assertions.AssertNotNil(n.wal, "WAL cannot be nil")
 
-	n.cancel()
-
-	if n.wal != nil {
-		if err := n.wal.Close(); err != nil {
-			log.Printf("[Node %s] Error closing WAL: %v", n.config.Addr, err)
-		}
+	// Take final snapshot of counter state
+	if err := n.wal.WriteCounterState(n.counter); err != nil {
+		n.logger.Error("failed to write final counter state to WAL",
+			"node", n.config.Addr,
+			"error", err)
 	}
 
+	// Do a final cleanup before closing
+	if err := n.wal.CleanupSegments(wal.CleanupConfig{
+		MaxSegments: n.config.WALMaxSegments,
+		MinSegments: n.config.WALMinSegments,
+		MaxAge:      n.config.WALMaxAge,
+	}); err != nil {
+		n.logger.Error("failed to cleanup WAL segments during shutdown",
+			"node", n.config.Addr,
+			"error", err)
+	}
+
+	// Close WAL
+	if err := n.wal.Close(); err != nil {
+		n.logger.Error("failed to close WAL",
+			"node", n.config.Addr,
+			"error", err)
+	}
+
+	n.cancel()
 	return n.transport.Close()
+}
+
+func (n *Node) GetPeerManager() *peer.PeerManager {
+	assertions.AssertNotNil(n.peers, "peer manager cannot be nil")
+	return n.peers
+}
+
+func (n *Node) logCounterState(msg string, additionalFields ...any) {
+	increments, decrements := n.counter.Counters()
+	fields := []any{
+		"node", n.config.Addr,
+		"counter_value", n.counter.Value(),
+		"increments", increments,
+		"decrements", decrements,
+	}
+
+	// Append any additional context fields
+	fields = append(fields, additionalFields...)
+
+	n.logger.Info(msg, fields...)
+}
+
+type CounterEntry struct {
+	NodeID string
+	Value  uint64
+}
+
+func deterministicSerialize(increments, decrements crdt.PNMap) ([]byte, error) {
+	// Combine all keys from both maps to get the complete set of node IDs
+	allNodeIDs := make(map[string]struct{})
+	for nodeID := range increments {
+		allNodeIDs[nodeID] = struct{}{}
+	}
+	for nodeID := range decrements {
+		allNodeIDs[nodeID] = struct{}{}
+	}
+
+	// Create a sorted slice of all node IDs
+	sortedNodeIDs := make([]string, 0, len(allNodeIDs))
+	for nodeID := range allNodeIDs {
+		sortedNodeIDs = append(sortedNodeIDs, nodeID)
+	}
+	sort.Strings(sortedNodeIDs)
+
+	orderedIncrements := make([]CounterEntry, len(sortedNodeIDs))
+	orderedDecrements := make([]CounterEntry, len(sortedNodeIDs))
+
+	for i, nodeID := range sortedNodeIDs {
+		// Use the value if it exists, or 0 if it doesn't
+		incValue := increments[nodeID] // Will be 0 if key doesn't exist
+		decValue := decrements[nodeID] // Will be 0 if key doesn't exist
+
+		orderedIncrements[i] = CounterEntry{NodeID: nodeID, Value: incValue}
+		orderedDecrements[i] = CounterEntry{NodeID: nodeID, Value: decValue}
+	}
+
+	return msgpack.Marshal([]any{orderedIncrements, orderedDecrements})
 }

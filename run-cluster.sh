@@ -5,7 +5,7 @@ DISCOVERY_PORT=8000
 BASE_NODE_PORT=9000
 BASE_HTTP_PORT=8010
 NUM_NODES=5
-PART3_DIR="./part3"
+PART4_DIR="./part4"
 LOG_DIR="./logs"
 
 # Colors for better output
@@ -88,21 +88,21 @@ function is_http_running {
 # Function to check if file paths for the cluster exist
 function check_paths {
   # Check if part3 directory exists
-  if [ ! -d "$PART3_DIR" ]; then
-    echo -e "${RED}ERROR: Directory $PART3_DIR does not exist${NC}"
+  if [ ! -d "$PART4_DIR" ]; then
+    echo -e "${RED}ERROR: Directory $PART4_DIR does not exist${NC}"
     echo "This script should be run from the parent directory of part3"
     return 1
   fi
 
   # Check if discovery main.go exists
-  if [ ! -f "$PART3_DIR/cmd/discovery/main.go" ]; then
-    echo -e "${RED}ERROR: Discovery server code not found at $PART3_DIR/cmd/discovery/main.go${NC}"
+  if [ ! -f "$PART4_DIR/cmd/discovery/main.go" ]; then
+    echo -e "${RED}ERROR: Discovery server code not found at $PART4_DIR/cmd/discovery/main.go${NC}"
     return 1
   fi
 
   # Check if counter main.go exists
-  if [ ! -f "$PART3_DIR/cmd/counter/main.go" ]; then
-    echo -e "${RED}ERROR: Counter code not found at $PART3_DIR/cmd/counter/main.go${NC}"
+  if [ ! -f "$PART4_DIR/cmd/counter/main.go" ]; then
+    echo -e "${RED}ERROR: Counter code not found at $PART4_DIR/cmd/counter/main.go${NC}"
     return 1
   fi
 
@@ -154,7 +154,7 @@ function start_discovery {
   else
     mkdir -p $LOG_DIR
     # Using full path for better process tracking
-    go run $PART3_DIR/cmd/discovery/main.go --port=$DISCOVERY_PORT --cleanup=5s >$LOG_DIR/discovery.log 2>&1 &
+    go run $PART4_DIR/cmd/discovery/main.go --port=$DISCOVERY_PORT --cleanup=5s >$LOG_DIR/discovery.log 2>&1 &
     local pid=$!
     echo -e "${GREEN}Discovery server started with PID $pid${NC}"
     # Check if it's actually running
@@ -171,33 +171,48 @@ function start_discovery {
 }
 
 # Function to start node
+# Function to start node
 function start_node {
   local node_num=$1
   local node_port=$((BASE_NODE_PORT + node_num - 1))
   local http_port=$((BASE_HTTP_PORT + node_num - 1))
 
-  # Set different parameters based on node number for diversity in testing
-  local max_peers=2
-  local sync_interval="2s"
-  local wal_enabled=true
-  local fsync_enabled=true
+  # Create data directory for this node
+  local node_data_dir="data/node-$node_num"
+  mkdir -p "$node_data_dir"
 
+  # Set basic parameters for all nodes
+  local params=(
+    "--addr=localhost:$node_port"
+    "--discovery=localhost:$DISCOVERY_PORT"
+    "--http-port=$http_port"
+    "--data-dir=$node_data_dir"
+  )
+
+  # Set different parameters based on node number for diversity in testing
   case $node_num in
   2) # Node 2 - More aggressive sync
-    max_peers=3
-    sync_interval="1s"
+    params+=(
+      "--max-peers=3"
+      "--sync=1s"
+    )
     ;;
-  3) # Node 3 - No WAL
-    wal_enabled=false
-    fsync_enabled=false
+  3) # Node 3 - Fewer WAL segments
+    params+=(
+      "--wal-max-segments=10"
+      "--wal-min-segments=2"
+    )
     ;;
-  4) # Node 4 - WAL without fsync
-    wal_enabled=true
-    fsync_enabled=false
+  4) # Node 4 - Frequent snapshots
+    params+=(
+      "--snapshot-interval=1m"
+    )
     ;;
   5) # Node 5 - Slower sync
-    max_peers=1
-    sync_interval="5s"
+    params+=(
+      "--max-peers=1"
+      "--sync=5s"
+    )
     ;;
   esac
 
@@ -205,14 +220,7 @@ function start_node {
   if is_running $node_port; then
     echo -e "${YELLOW}Node $node_num already running on port $node_port${NC}"
   else
-    go run $PART3_DIR/cmd/counter/main.go \
-      --addr="localhost:$node_port" \
-      --discovery="localhost:$DISCOVERY_PORT" \
-      --max-peers=$max_peers \
-      --sync=$sync_interval \
-      --wal=$wal_enabled \
-      --wal-fsync=$fsync_enabled \
-      >$LOG_DIR/node-$node_num.log 2>&1 &
+    go run $PART4_DIR/cmd/counter/main.go "${params[@]}" >$LOG_DIR/node-$node_num.log 2>&1 &
     local pid=$!
     echo -e "${GREEN}Node $node_num started with PID $pid${NC}"
     # Check if it's actually running
@@ -257,16 +265,15 @@ function node_request {
   curl -s "http://localhost:$http_port/$endpoint"
 }
 
-# Function to get counter from a node
 function get_counter_value {
   local node_num=$1
   local result=$(node_request $node_num "counter")
   local counter=$(echo "$result" | grep -oE "Counter: [0-9]+" | cut -d' ' -f2)
-  local version=$(echo "$result" | grep -oE "version [0-9]+" | cut -d' ' -f2)
 
-  # Return as counter:version format
-  if [ -n "$counter" ] && [ -n "$version" ]; then
-    echo "$counter:$version"
+  # Check if we got a valid counter value
+  if [ -n "$counter" ]; then
+    # Just return the counter value without version
+    echo "$counter"
   else
     echo "ERROR"
   fi
@@ -290,12 +297,9 @@ function check_consistency {
         echo -e "${RED}Node $i: Error getting counter value${NC}"
         consistent=false
       else
-        local counter=${result%:*}
-        local version=${result#*:}
-
-        echo -e "${GREEN}Node $i: Counter=$counter, Version=$version${NC}"
+        local counter=$result
+        echo -e "${GREEN}Node $i: Counter=$counter${NC}"
         values+=("$result")
-
         if [ -z "$first_value" ]; then
           first_value=$result
         elif [ "$result" != "$first_value" ]; then
@@ -768,7 +772,7 @@ function process_command {
   clean)
     echo "Cleaning up logs and data..."
     rm -rf $LOG_DIR/*
-    rm -rf data/wal/*
+    rm -rf data
     echo -e "${GREEN}Cleanup complete${NC}"
     ;;
 

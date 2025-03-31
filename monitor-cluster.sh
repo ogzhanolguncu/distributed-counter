@@ -27,19 +27,14 @@ while true; do
 
   # Extract counter values and versions using more compatible grep patterns
   node1_counter=$(echo "$node1_data" | grep -o "Counter: [0-9]*" | cut -d' ' -f2 || echo "?")
-  node1_version=$(echo "$node1_data" | grep -o "version [0-9]*" | cut -d' ' -f2 || echo "?")
 
   node2_counter=$(echo "$node2_data" | grep -o "Counter: [0-9]*" | cut -d' ' -f2 || echo "?")
-  node2_version=$(echo "$node2_data" | grep -o "version [0-9]*" | cut -d' ' -f2 || echo "?")
 
   node3_counter=$(echo "$node3_data" | grep -o "Counter: [0-9]*" | cut -d' ' -f2 || echo "?")
-  node3_version=$(echo "$node3_data" | grep -o "version [0-9]*" | cut -d' ' -f2 || echo "?")
 
   node4_counter=$(echo "$node4_data" | grep -o "Counter: [0-9]*" | cut -d' ' -f2 || echo "?")
-  node4_version=$(echo "$node4_data" | grep -o "version [0-9]*" | cut -d' ' -f2 || echo "?")
 
   node5_counter=$(echo "$node5_data" | grep -o "Counter: [0-9]*" | cut -d' ' -f2 || echo "?")
-  node5_version=$(echo "$node5_data" | grep -o "version [0-9]*" | cut -d' ' -f2 || echo "?")
 
   # Check for convergence
   if [[ "$node1_counter" == "$node2_counter" &&
@@ -60,13 +55,13 @@ while true; do
   echo
   echo "Time: $timestamp"
   echo
-  echo "Node | Counter | Version"
-  echo "-----|---------|--------"
-  echo "  1  |   $node1_counter   |   $node1_version"
-  echo "  2  |   $node2_counter   |   $node2_version"
-  echo "  3  |   $node3_counter   |   $node3_version"
-  echo "  4  |   $node4_counter   |   $node4_version"
-  echo "  5  |   $node5_counter   |   $node5_version"
+  echo "Node | Counter            "
+  echo "-----|------------------- "
+  echo "  1  |   $node1_counter   "
+  echo "  2  |   $node2_counter   "
+  echo "  3  |   $node3_counter   "
+  echo "  4  |   $node4_counter   "
+  echo "  5  |   $node5_counter   "
   echo
   echo "Status: $convergence"
   echo

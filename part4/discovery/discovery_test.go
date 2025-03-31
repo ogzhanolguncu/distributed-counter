@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ogzhanolguncu/distributed-counter/part3/node"
-	"github.com/ogzhanolguncu/distributed-counter/part3/peer"
-	"github.com/ogzhanolguncu/distributed-counter/part3/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part4/node"
+	"github.com/ogzhanolguncu/distributed-counter/part4/peer"
+	"github.com/ogzhanolguncu/distributed-counter/part4/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
