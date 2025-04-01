@@ -21,6 +21,19 @@ const (
 	MaxMessageSize       = 10 * 1024 * 1024 // 10MB max message size
 )
 
+func MessageTypeToString(msgType uint8) string {
+	switch msgType {
+	case MessageTypePush:
+		return "Push"
+	case MessageTypeDigestPull:
+		return "DigestPull"
+	case MessageTypeDigestAck:
+		return "DigestAck"
+	default:
+		return "Unknown"
+	}
+}
+
 var (
 	ErrEmptyMessage    = errors.New("protocol: empty message data")
 	ErrDecompression   = errors.New("protocol: failed to decompress data")

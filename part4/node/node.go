@@ -16,6 +16,7 @@ import (
 	"github.com/ogzhanolguncu/distributed-counter/part4/crdt"
 	"github.com/ogzhanolguncu/distributed-counter/part4/peer"
 	"github.com/ogzhanolguncu/distributed-counter/part4/protocol"
+	"github.com/ogzhanolguncu/distributed-counter/part4/visualizer"
 	"github.com/ogzhanolguncu/distributed-counter/part4/wal"
 	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/sync/errgroup"
@@ -67,6 +68,8 @@ type Node struct {
 	fullSyncTick <-chan time.Time
 	snapshotTick <-chan time.Time
 	wal          *wal.WAL
+
+	visualizer *visualizer.GossipVisualizer
 }
 
 func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
@@ -696,4 +699,28 @@ func deterministicSerialize(increments, decrements crdt.PNMap) ([]byte, error) {
 	}
 
 	return msgpack.Marshal([]any{orderedIncrements, orderedDecrements})
+}
+
+func (n *Node) SetVisualizer(vis *visualizer.GossipVisualizer) {
+	n.visualizer = vis
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if n.visualizer != nil {
+					n.visualizer.RecordNodeState(
+						n.GetAddr(),
+						n.GetCounter(),
+						n.peers.GetPeers(),
+					)
+				}
+			case <-n.ctx.Done():
+				return
+			}
+		}
+	}()
 }
