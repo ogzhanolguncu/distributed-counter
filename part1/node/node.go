@@ -393,7 +393,8 @@ func (n *Node) Increment() {
 	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
 	oldValue := n.counter.Value()
-	newValue := n.counter.Increment(n.config.Addr)
+	n.counter.Increment(n.config.Addr)
+	newValue := n.counter.Value()
 
 	increments, decrements := n.counter.Counters()
 	n.logger.Info("incremented counter",
@@ -409,7 +410,8 @@ func (n *Node) Decrement() {
 	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
 	oldValue := n.counter.Value()
-	newValue := n.counter.Decrement(n.config.Addr)
+	n.counter.Decrement(n.config.Addr)
+	newValue := n.counter.Value()
 
 	increments, decrements := n.counter.Counters()
 
