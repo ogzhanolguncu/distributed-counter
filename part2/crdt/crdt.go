@@ -2,277 +2,175 @@ package crdt
 
 import (
 	"maps"
-	"sync/atomic"
-	"time"
+	"sync"
 )
-
-const maxRetryCount = 50
 
 type (
+	// PNMap stores node IDs and their corresponding counts.
 	PNMap map[string]uint64
 
-	// RefCountedMap wraps a PNMap with reference counting for Copy-on-Write operations
-	RefCountedMap struct {
-		data     PNMap
-		refCount int32 // Using atomic operations for thread-safe reference counting
-	}
-
-	// PNCounter (Positive-Negative Counter) is a conflict-free replicated data type (CRDT)
-	// that allows both incrementing and decrementing a counter in a distributed system.
-	// This version uses Copy-on-Write with Reference Counting for improved performance.
+	// PNCounter (Positive-Negative Counter) using separate RWMutexes
+	// for increments and decrements to potentially increase concurrency
+	// between increment and decrement operations.
 	PNCounter struct {
-		increments atomic.Pointer[RefCountedMap]
-		decrements atomic.Pointer[RefCountedMap]
+		incMu      sync.RWMutex
+		decMu      sync.RWMutex
+		increments PNMap
+		decrements PNMap
 	}
 )
 
-// NewRefCountedMap creates a new map with an initial reference count of 1
-func NewRefCountedMap() *RefCountedMap {
-	return &RefCountedMap{
-		data:     make(PNMap),
-		refCount: 1, // Start with 1 reference
+// New creates a new PNCounter with the provided node ID,
+// initializing separate maps and mutexes.
+func New(nodeId string) *PNCounter {
+	// Initialize maps directly
+	incMap := make(PNMap)
+	incMap[nodeId] = 0
+
+	decMap := make(PNMap)
+	decMap[nodeId] = 0
+
+	return &PNCounter{
+		increments: incMap,
+		decrements: decMap,
 	}
 }
 
-// Acquire increments the reference count
-func (r *RefCountedMap) Acquire() {
-	atomic.AddInt32(&r.refCount, 1)
-}
-
-// Release decrements the reference count and returns true if the count reached zero
-func (r *RefCountedMap) Release() bool {
-	return atomic.AddInt32(&r.refCount, -1) == 0
-}
-
-// New creates a new PNCounter with the provided node ID
-func New(nodeId string) *PNCounter {
-	c := &PNCounter{}
-
-	// Initialize increment map with node ID
-	incMap := NewRefCountedMap()
-	incMap.data[nodeId] = 0
-	c.increments.Store(incMap)
-
-	// Initialize decrement map with node ID
-	decMap := NewRefCountedMap()
-	decMap.data[nodeId] = 0
-	c.decrements.Store(decMap)
-
-	return c
-}
-
-// Value returns the current value of the counter (increments - decrements)
+// Value returns the current value of the counter (increments - decrements).
+// It acquires read locks on both increment and decrement maps.
 func (p *PNCounter) Value() int64 {
-	increments := p.increments.Load()
-	decrements := p.decrements.Load()
+	// Acquire locks in a consistent order (inc then dec)
+	p.incMu.RLock()
+	defer p.incMu.RUnlock() // Ensure inc unlock happens
+
+	p.decMu.RLock()
+	defer p.decMu.RUnlock() // Ensure dec unlock happens
 
 	var incSum, decSum uint64
-	for _, v := range increments.data {
+	for _, v := range p.increments {
 		incSum += v
 	}
-	for _, v := range decrements.data {
+	for _, v := range p.decrements {
 		decSum += v
 	}
 
 	return int64(incSum) - int64(decSum)
 }
 
-// LocalValue returns the net value for a specific node
+// LocalValue returns the net value for a specific node.
+// It acquires read locks on both increment and decrement maps.
 func (p *PNCounter) LocalValue(nodeId string) int64 {
-	increments := p.increments.Load()
-	decrements := p.decrements.Load()
+	// Acquire locks in a consistent order
+	p.incMu.RLock()
+	defer p.incMu.RUnlock()
 
-	var incSum, decSum uint64
-	if val, ok := increments.data[nodeId]; ok {
-		incSum = val
+	p.decMu.RLock()
+	defer p.decMu.RUnlock()
+
+	var incVal, decVal uint64
+	// Direct access within the locks
+	if val, ok := p.increments[nodeId]; ok {
+		incVal = val
+	}
+	if val, ok := p.decrements[nodeId]; ok {
+		decVal = val
 	}
 
-	if val, ok := decrements.data[nodeId]; ok {
-		decSum = val
-	}
-
-	return int64(incSum) - int64(decSum)
+	return int64(incVal) - int64(decVal)
 }
 
-// Increment atomically increments the counter for the specified node
-func (p *PNCounter) Increment(nodeId string) int64 {
-	retry := &Retry[int64]{
-		MaxAttempts: maxRetryCount,
-		Delay:       1 * time.Millisecond,
+// Increment increments the counter for the specified node.
+// It acquires a write lock only on the increments map.
+func (p *PNCounter) Increment(nodeId string) {
+	p.incMu.Lock() // Acquire increments write lock
+	defer p.incMu.Unlock()
+
+	// Direct modification within the lock
+	if _, exists := p.increments[nodeId]; !exists {
+		p.increments[nodeId] = 0 // Initialize if node is new
 	}
-
-	return retry.Do(func() RetryResult[int64] {
-		// Get the current ref-counted map
-		currentMap := p.increments.Load()
-
-		// Create a new map with the same data
-		newMap := NewRefCountedMap()
-		maps.Copy(newMap.data, currentMap.data)
-
-		// Make our increment
-		if _, exists := newMap.data[nodeId]; !exists {
-			newMap.data[nodeId] = 0
-		}
-		newMap.data[nodeId]++
-
-		// Try to swap atomically
-		if p.increments.CompareAndSwap(currentMap, newMap) {
-			// Successfully swapped, release old reference
-			currentMap.Release()
-			return RetryResult[int64]{Value: p.Value(), Done: true}
-		}
-
-		// Failed to swap, discard our new map
-		return RetryResult[int64]{Value: p.Value(), Done: false}
-	})
+	p.increments[nodeId]++
 }
 
-// Decrement atomically decrements the counter for the specified node
-func (p *PNCounter) Decrement(nodeId string) int64 {
-	retry := &Retry[int64]{
-		MaxAttempts: maxRetryCount,
-		Delay:       1 * time.Millisecond,
+// Decrement increments the decrement counter for the specified node.
+// It acquires a write lock only on the decrements map.
+func (p *PNCounter) Decrement(nodeId string) {
+	p.decMu.Lock() // Acquire decrements write lock
+	defer p.decMu.Unlock()
+
+	// Direct modification within the lock
+	if _, exists := p.decrements[nodeId]; !exists {
+		p.decrements[nodeId] = 0 // Initialize if node is new
 	}
-
-	return retry.Do(func() RetryResult[int64] {
-		// Get the current ref-counted map
-		currentMap := p.decrements.Load()
-
-		// Create a new map with the same data
-		newMap := NewRefCountedMap()
-		maps.Copy(newMap.data, currentMap.data)
-
-		// Make our decrement
-		if _, exists := newMap.data[nodeId]; !exists {
-			newMap.data[nodeId] = 0
-		}
-		newMap.data[nodeId]++
-
-		// Try to swap atomically
-		if p.decrements.CompareAndSwap(currentMap, newMap) {
-			// Successfully swapped, release old reference
-			currentMap.Release()
-			return RetryResult[int64]{Value: p.Value(), Done: true}
-		}
-
-		// Failed to swap, discard our new map
-		return RetryResult[int64]{Value: p.Value(), Done: false}
-	})
+	p.decrements[nodeId]++ // PNCounter increments the *decrement* map
 }
 
-// Counters returns copies of the increment and decrement counter maps
+// Counters returns copies of the increment and decrement counter maps.
+// It acquires read locks on both maps.
 func (p *PNCounter) Counters() (PNMap, PNMap) {
-	increments := p.increments.Load().data
-	decrements := p.decrements.Load().data
+	// Acquire locks in a consistent order
+	p.incMu.RLock()
+	defer p.incMu.RUnlock()
 
-	// Create independent copies
-	incCopy := make(PNMap, len(increments))
-	decCopy := make(PNMap, len(decrements))
+	p.decMu.RLock()
+	defer p.decMu.RUnlock()
 
-	maps.Copy(incCopy, increments)
-	maps.Copy(decCopy, decrements)
+	// Create independent copies while holding the locks
+	incCopy := make(PNMap, len(p.increments))
+	decCopy := make(PNMap, len(p.decrements))
+
+	maps.Copy(incCopy, p.increments)
+	maps.Copy(decCopy, p.decrements)
 
 	return incCopy, decCopy
 }
 
-// MergeIncrements merges external increment values with the local counter
+// MergeIncrements merges external increment values with the local counter.
+// It acquires a write lock only on the increments map.
 func (p *PNCounter) MergeIncrements(other PNMap) bool {
-	retry := &Retry[bool]{
-		MaxAttempts: maxRetryCount,
-		Delay:       1 * time.Millisecond,
+	p.incMu.Lock() // Acquire increments write lock
+	defer p.incMu.Unlock()
+
+	updated := false
+	for nodeID, otherValue := range other {
+		currentValue, exists := p.increments[nodeID]
+		// Merge condition: take the max value
+		if (!exists && otherValue > 0) || otherValue > currentValue {
+			p.increments[nodeID] = otherValue
+			updated = true
+		}
 	}
-
-	return retry.Do(func() RetryResult[bool] {
-		currentMap := p.increments.Load()
-
-		// Check if there are any updates needed
-		updated := false
-		for nodeID, otherValue := range other {
-			currentValue, exists := currentMap.data[nodeID]
-			if (!exists && otherValue > 0) || otherValue > currentValue {
-				updated = true
-				break
-			}
-		}
-
-		if !updated {
-			return RetryResult[bool]{Value: false, Done: true}
-		}
-
-		// Create a new map with updates
-		newMap := NewRefCountedMap()
-		maps.Copy(newMap.data, currentMap.data)
-
-		// Merge by taking max value for each node
-		for nodeID, otherValue := range other {
-			currentValue, exists := newMap.data[nodeID]
-			if (!exists && otherValue > 0) || otherValue > currentValue {
-				newMap.data[nodeID] = otherValue
-			}
-		}
-
-		// Try to swap
-		if p.increments.CompareAndSwap(currentMap, newMap) {
-			currentMap.Release()
-			return RetryResult[bool]{Value: true, Done: true}
-		}
-
-		// Failed to swap
-		return RetryResult[bool]{Value: false, Done: false}
-	})
+	return updated
 }
 
-// MergeDecrements merges external decrement values with the local counter
+// MergeDecrements merges external decrement values with the local counter.
+// It acquires a write lock only on the decrements map.
 func (p *PNCounter) MergeDecrements(other PNMap) bool {
-	retry := &Retry[bool]{
-		MaxAttempts: maxRetryCount,
-		Delay:       1 * time.Millisecond,
+	p.decMu.Lock() // Acquire decrements write lock
+	defer p.decMu.Unlock()
+
+	updated := false
+	for nodeID, otherValue := range other {
+		currentValue, exists := p.decrements[nodeID]
+		// Merge condition: take the max value
+		if (!exists && otherValue > 0) || otherValue > currentValue {
+			p.decrements[nodeID] = otherValue
+			updated = true
+		}
 	}
-
-	return retry.Do(func() RetryResult[bool] {
-		currentMap := p.decrements.Load()
-
-		// Check if there are any updates needed
-		updated := false
-		for nodeID, otherValue := range other {
-			currentValue, exists := currentMap.data[nodeID]
-			if (!exists && otherValue > 0) || otherValue > currentValue {
-				updated = true
-				break
-			}
-		}
-
-		if !updated {
-			return RetryResult[bool]{Value: false, Done: true}
-		}
-
-		// Create a new map with updates
-		newMap := NewRefCountedMap()
-		maps.Copy(newMap.data, currentMap.data)
-
-		// Merge by taking max value for each node
-		for nodeID, otherValue := range other {
-			currentValue, exists := newMap.data[nodeID]
-			if (!exists && otherValue > 0) || otherValue > currentValue {
-				newMap.data[nodeID] = otherValue
-			}
-		}
-
-		// Try to swap
-		if p.decrements.CompareAndSwap(currentMap, newMap) {
-			currentMap.Release()
-			return RetryResult[bool]{Value: true, Done: true}
-		}
-
-		// Failed to swap
-		return RetryResult[bool]{Value: false, Done: false}
-	})
+	return updated
 }
 
-// Merge combines this counter with another
+// Merge combines this counter with another counter's state.
+// It acquires write locks on the local counter via MergeIncrements/MergeDecrements
+// and read locks on the other counter via its Counters() method.
 func (p *PNCounter) Merge(other *PNCounter) bool {
+	// Get copies of the other counter's state (acquires RLock on 'other' maps)
 	otherIncrements, otherDecrements := other.Counters()
+
+	// Merge into the local counter (acquires Lock on 'p' maps respectively)
 	incUpdated := p.MergeIncrements(otherIncrements)
-	decUpdate := p.MergeDecrements(otherDecrements)
-	return incUpdated || decUpdate
+	decUpdated := p.MergeDecrements(otherDecrements)
+
+	return incUpdated || decUpdated
 }

@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -27,11 +26,6 @@ type Config struct {
 	FullSyncInterval time.Duration
 	MaxSyncPeers     int
 	LogLevel         slog.Level
-}
-
-type State struct {
-	counter atomic.Uint64
-	version atomic.Uint32
 }
 
 type MessageInfo struct {
@@ -401,23 +395,25 @@ func (n *Node) Increment() {
 	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
 	oldValue := n.counter.Value()
-	newValue := n.counter.Increment(n.config.Addr)
+	n.counter.Increment(n.config.Addr)
+	newValue := n.counter.Value()
 
 	increments, decrements := n.counter.Counters()
-
 	n.logger.Info("incremented counter",
 		"node", n.config.Addr,
 		"from", oldValue,
 		"to", newValue,
 		"increments", increments,
-		"decrements", decrements)
+		"decrements", decrements,
+	)
 }
 
 func (n *Node) Decrement() {
 	assertions.AssertNotNil(n.counter, "node counter cannot be nil")
 
 	oldValue := n.counter.Value()
-	newValue := n.counter.Decrement(n.config.Addr)
+	n.counter.Decrement(n.config.Addr)
+	newValue := n.counter.Value()
 
 	increments, decrements := n.counter.Counters()
 
@@ -457,6 +453,7 @@ func (n *Node) GetPeerManager() *peer.PeerManager {
 	return n.peers
 }
 
+// Helper method to standardize logging of counter state
 func (n *Node) logCounterState(msg string, additionalFields ...any) {
 	increments, decrements := n.counter.Counters()
 	fields := []any{

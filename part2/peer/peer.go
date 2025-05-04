@@ -6,9 +6,6 @@ import (
 	"github.com/ogzhanolguncu/distributed-counter/part2/assertions"
 )
 
-// Track contacted peers and
-// Peer Selection Strategy: "Interact with the least contacted node" for better coverage
-
 type Peer struct {
 	Addr string
 }
