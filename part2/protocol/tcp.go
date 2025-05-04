@@ -3,9 +3,9 @@ package protocol
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"net"
-	"strings"
+	"os"
 	"sync"
 	"time"
 
@@ -16,25 +16,20 @@ const (
 	ReadBufferSize = 16 * 1024 // 16KB buffer for reading
 	ReadTimeout    = 5 * time.Second
 	WriteTimeout   = 5 * time.Second
-	maxMessageSize = 10 * 1024 * 1024 // 10MB max message size
+	DialTimeout    = 5 * time.Second
 )
 
-// Simple header for our messages
-// [4 bytes message length][variable length address][1 byte separator][message payload]
-// This allows us to properly frame messages without modifying their content
-
 type TCPTransport struct {
-	addr     string // This node's listening address
+	addr     string
 	listener net.Listener
 	handler  func(string, []byte) error
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
-	// Map to keep track of actual peer addresses
-	peerAddrs sync.Map // Maps IP -> full listening address
+	logger   *slog.Logger
 }
 
-func NewTCPTransport(addr string) (*TCPTransport, error) {
+func NewTCPTransport(addr string, logger *slog.Logger) (*TCPTransport, error) {
 	assertions.Assert(addr != "", "transport address cannot be empty")
 
 	listener, err := net.Listen("tcp", addr)
@@ -44,11 +39,20 @@ func NewTCPTransport(addr string) (*TCPTransport, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		}))
+	}
+
+	transportLogger := logger.With("component", "TCPTransport", "addr", addr)
+
 	transport := &TCPTransport{
 		addr:     addr,
 		listener: listener,
 		ctx:      ctx,
 		cancel:   cancel,
+		logger:   transportLogger,
 	}
 
 	assertions.AssertNotNil(transport.listener, "listener must be initialized")
@@ -66,16 +70,16 @@ func (t *TCPTransport) Send(addr string, data []byte) error {
 	assertions.Assert(t.addr != addr, "transport cannot send data to itself")
 
 	// Establish connection with timeout
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, DialTimeout)
 	if err != nil {
-		log.Printf("[TCP Transport] Connection error to %s: %v", addr, err)
+		t.logger.Error("connection error", "target", addr, "error", err)
 		return err
 	}
 	defer conn.Close()
 
 	// Set write deadline
 	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
-		log.Printf("[TCP Transport] Set deadline error: %v", err)
+		t.logger.Error("set deadline error", "error", err)
 		return err
 	}
 
@@ -106,12 +110,12 @@ func (t *TCPTransport) Send(addr string, data []byte) error {
 	// Write the entire message
 	written, err := conn.Write(message)
 	if err != nil {
-		log.Printf("[TCP Transport] Write error: %v", err)
+		t.logger.Error("write error", "target", addr, "error", err)
 		return err
 	}
 
 	if written != len(message) {
-		log.Printf("[TCP Transport] Warning: Only sent %d of %d bytes to %s", written, len(message), addr)
+		t.logger.Warn("partial write", "written", written, "total", len(message), "target", addr)
 	}
 
 	return nil
@@ -127,35 +131,30 @@ func (t *TCPTransport) Listen(handler func(string, []byte) error) error {
 
 	go func() {
 		defer t.wg.Done()
-
 		for {
 			select {
 			case <-t.ctx.Done():
 				return
 			default:
-				// Set accept deadline to make the listener responsive to context cancellation
-				if err := t.listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second)); err != nil {
-					if t.ctx.Err() == nil {
-						log.Printf("[TCP Transport] Failed to set accept deadline: %v", err)
-					}
+				// Set deadline to make the listener responsive to cancellation
+				deadline := time.Now().Add(1 * time.Second)
+				if err := t.listener.(*net.TCPListener).SetDeadline(deadline); err != nil && t.ctx.Err() == nil {
+					t.logger.Error("failed to set accept deadline", "error", err)
 				}
 
 				conn, err := t.listener.Accept()
 				if err != nil {
-					// Check if the error is due to deadline
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						continue // Just a timeout, try again
 					}
 
-					// Only continue if we're not shutting down
 					if t.ctx.Err() == nil {
-						log.Printf("[TCP Transport] Error accepting connection: %v", err)
-						continue
+						t.logger.Error("error accepting connection", "error", err)
 					}
-					return
+					continue
 				}
 
-				assertions.AssertNotNil(conn, "accepted connection cannot be nil")
+				// We still need the concurrent connection handling
 				go t.handleConn(conn)
 			}
 		}
@@ -170,6 +169,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 
 	// Set read deadline
 	if err := conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		t.logger.Error("failed to set read deadline", "remote_addr", conn.RemoteAddr(), "error", err)
 		return
 	}
 
@@ -178,7 +178,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 	n, err := conn.Read(buf)
 	if err != nil {
 		if err != io.EOF {
-			log.Printf("[TCP Transport] Read error from %s: %v", conn.RemoteAddr(), err)
+			t.logger.Error("read error", "remote_addr", conn.RemoteAddr(), "error", err)
 		}
 		return
 	}
@@ -198,19 +198,19 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 	// that stores the address length.
 
 	if n < 2 { // Need at least 1 byte for address length + 1 byte of address
-		log.Printf("[TCP Transport] Message too short from %s: %d bytes", conn.RemoteAddr(), n)
+		t.logger.Error("message too short", "remote_addr", conn.RemoteAddr(), "bytes", n)
 		return
 	}
 
 	addrLen := int(buf[0]) // Get address length from first byte
 	if addrLen == 0 || addrLen > 255 || 1+addrLen >= n {
-		log.Printf("[TCP Transport] Invalid address length from %s: %d", conn.RemoteAddr(), addrLen)
+		t.logger.Error("invalid address length", "remote_addr", conn.RemoteAddr(), "addr_len", addrLen)
 		return
 	}
 
 	senderAddr := string(buf[1 : 1+addrLen]) // Extract address from bytes 1 to 1+addrLen-1
 	if len(senderAddr) == 0 {
-		log.Printf("[TCP Transport] Empty sender address")
+		t.logger.Error("empty sender address")
 		return
 	}
 
@@ -220,14 +220,10 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Store mapping from IP to sender address
-	remoteIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
-	t.peerAddrs.Store(remoteIP, senderAddr)
-
 	// Invoke the handler with the sender address and payload
 	if t.handler != nil {
 		if err := t.handler(senderAddr, payload); err != nil {
-			log.Printf("[TCP Transport] Handler error for message from %s: %v", senderAddr, err)
+			t.logger.Error("handler error", "sender", senderAddr, "error", err)
 		}
 	}
 }
@@ -236,6 +232,7 @@ func (t *TCPTransport) Close() error {
 	assertions.AssertNotNil(t.cancel, "cancel function cannot be nil")
 	assertions.AssertNotNil(t.ctx, "context cannot be nil")
 
+	t.logger.Info("closing transport")
 	t.cancel()
 	if t.listener != nil {
 		t.listener.Close()

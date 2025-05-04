@@ -9,7 +9,7 @@ import (
 )
 
 func TestTCPTransport_Basic(t *testing.T) {
-	receiver, err := NewTCPTransport("127.0.0.1:0")
+	receiver, err := NewTCPTransport("127.0.0.1:0", nil)
 	require.NoError(t, err)
 	received := make(chan []byte, 1)
 
@@ -20,7 +20,7 @@ func TestTCPTransport_Basic(t *testing.T) {
 	require.NoError(t, err, "Failed to start receiver")
 
 	actualAddr := receiver.listener.Addr().String()
-	sender, err := NewTCPTransport("127.0.0.1:0")
+	sender, err := NewTCPTransport("127.0.0.1:0", nil)
 	require.NoError(t, err)
 	testData := []byte("hello world")
 
@@ -39,7 +39,7 @@ func TestTCPTransport_Basic(t *testing.T) {
 }
 
 func TestTCPTransport_ConnectionRefused(t *testing.T) {
-	sender, err := NewTCPTransport("127.0.0.1:0")
+	sender, err := NewTCPTransport("127.0.0.1:0", nil)
 	require.NoError(t, err)
 
 	err = sender.Send("127.0.0.1:44444", []byte("test"))
@@ -49,7 +49,7 @@ func TestTCPTransport_ConnectionRefused(t *testing.T) {
 }
 
 func TestTCPTransport_ConcurrentConnections(t *testing.T) {
-	receiver, err := NewTCPTransport("127.0.0.1:0")
+	receiver, err := NewTCPTransport("127.0.0.1:0", nil)
 	require.NoError(t, err)
 
 	receivedCount := 0
@@ -71,7 +71,7 @@ func TestTCPTransport_ConcurrentConnections(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sender, err := NewTCPTransport("127.0.0.1:0")
+			sender, err := NewTCPTransport("127.0.0.1:0", nil)
 			require.NoError(t, err)
 			err = sender.Send(actualAddr, []byte("test"))
 			require.NoError(t, err, "Failed to send")

@@ -192,7 +192,7 @@ func createTestNode(t *testing.T, addr string, syncInterval time.Duration) *Node
 	}
 
 	peerManager := peer.NewPeerManager()
-	node, err := NewNode(config, transport, peerManager)
+	node, err := NewNode(config, transport, peerManager, nil)
 	require.NoError(t, err)
 	return node
 }

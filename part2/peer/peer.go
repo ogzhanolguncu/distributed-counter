@@ -65,14 +65,3 @@ func (pm *PeerManager) GetPeers() []string {
 
 	return peers
 }
-
-func (pm *PeerManager) ClearPeers() {
-	assertions.AssertNotNil(pm.peers, "peers map cannot be nil")
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	// Create a new map to replace the existing one
-	pm.peers = make(map[string]*Peer)
-
-	assertions.AssertEqual(len(pm.peers), 0, "peers map must be empty after clearing")
-}

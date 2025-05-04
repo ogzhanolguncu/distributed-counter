@@ -50,7 +50,7 @@ type Node struct {
 	fullSyncTick <-chan time.Time
 }
 
-func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager) (*Node, error) {
+func NewNode(config Config, transport protocol.Transport, peerManager *peer.PeerManager, logger *slog.Logger) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	assertions.Assert(config.SyncInterval > 0, "sync interval must be positive")
@@ -63,15 +63,19 @@ func NewNode(config Config, transport protocol.Transport, peerManager *peer.Peer
 		config.FullSyncInterval = config.SyncInterval * 10 // Default to 10x regular sync interval
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: config.LogLevel,
-	})).With("[NODE]", config.Addr)
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		}))
+	}
+
+	nodeLogger := logger.With("component", "NODE", "addr", config.Addr)
 
 	node := &Node{
 		config:    config,
 		counter:   crdt.New(config.Addr),
 		peers:     peerManager,
-		logger:    logger,
+		logger:    nodeLogger,
 		ctx:       ctx,
 		cancel:    cancel,
 		transport: transport,
