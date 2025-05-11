@@ -3,7 +3,7 @@ FROM golang:1.23.5 as builder
 WORKDIR /app
 COPY . .
 RUN go mod download
-RUN go build -o counter ./part3/cmd/counter/main.go
+RUN go build -o counter ./part4/cmd/counter/main.go
 
 FROM debian:bullseye-slim
 WORKDIR /app
