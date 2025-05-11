@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	ReadBufferSize = 16 * 1024 // 16KB buffer for reading
+	ReadBufferSize = 4 << 12 // 16KB buffer for reading
 	ReadTimeout    = 5 * time.Second
 	WriteTimeout   = 5 * time.Second
 	DialTimeout    = 5 * time.Second
